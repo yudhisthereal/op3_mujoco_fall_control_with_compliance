@@ -119,7 +119,7 @@ python main.py
 ## Metrics & Interpretation
 
 ### Net Disturbance Torque
-$$\tau_{dist} = |\text{qfrc\_constraint}| + |\text{qfrc\_actuator} - \text{qfrc\_bias}|$$
+$$\tau_{\text{dist}} = |\text{qfrc\_constraint}| + |\text{qfrc\_actuator} - \text{qfrc\_bias}|$$
 
 - `qfrc_constraint`: external & contact forces transmitted to joints.
 - `qfrc_actuator - qfrc_bias`: actuator demand minus gravity/Coriolis; isolates active and impact-driven loads.
