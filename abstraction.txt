@@ -1,0 +1,138 @@
+control timestep 20ms
+mujoco + gymnasium with render mode human, using the same camera angle as in tutorial.ipynb and scene
+
+make interface for setting stiffness scale and damping scale for compliance, and Clamp gain ranges.    
+push the robot forward at the head at simulation start
+control the robot to move to this joint angles with stiffness scale unchanged:
+"goal_angles": {
+    "r_sho_pitch": 1.0,
+    "l_sho_pitch": -1.0,
+    "r_sho_roll": -0.9,
+    "l_sho_roll": 0.9,
+    "r_el": 0.4,
+    "l_el": -0.4,
+    "r_hip_pitch": 0.57,
+    "l_hip_pitch": -0.57,
+    "r_knee": -1.5,
+    "l_knee": 1.5
+},
+detect impact by detecting spike in total torque load at runtime, log the total torque loads.
+generate a graph representing the torque load over timesteps
+do that ten times, alternatingly, one should be with stiff joints and the next should be with lowered stiffness scale and increased damping scale after the goal angle is reached (or close to be reached)
+generate an envelope line graph representing the total torque load over timesteps from experiments with vs without compliance.
+try restoring gains over time after torque loads subside
+
+domain randomization for limb masses
+noise perturbation for IMU during training
+make it parallel population training (one policy, many agents)
+
+Scope v1: forward fall, arms only
+
+protective_pose_arms = DECIDE LATER
+Reward = -head_impact_velocity(if any) - (joint_angles_arms-protective_pose_arms) - torque_load_after_impact
+
+# gymnasium_envs/op3_fall_control.py
+class Op3FallControlEnv(gymnaisum.Env)
+
+    # Observation space settings
+    # values should be normalized
+    def obs_joint(List joint_names, bool angle=True, bool torque_load=True)
+    def obs_fall_vel() -> continuous fall velocity
+    def obs_fall_vel_discrete() -> {NORMAL/FAST}
+    def obs_fall_angle() -> radians, where 0 is front, to the right is positive, and to the left is negative
+    def obs_fall_angle_discrete(int dirs=FallAngle.FOUR) -> {F/B/L/R/}, else if dirs==FallAngle.EIGHT {F/B/L/R/FL/FR/BL/BR}
+    def obs_kp() -> proportional gain of PD controller
+    def obs_kd() -> derivative gain of PD controller
+
+    # Action space settings
+    # action output values should be normalized
+    def act_joint(List joint_names) -> adds positional joint control, with target_q = current_q + angle_delta (controls value of angle_delta)
+    def act_kp() -> adds kp control (absolute continuous value >= 0)
+    def act_kd() -> adds kd control (absolute continuous value >= 0)
+    def act_kp_rel() -> adds kp control (relative continuous value, kp can't be below 0)
+    def act_kd_rel() -> adds kd control (relative continuous value, kd can't be below 0)
+    
+    # Core function
+    _get_obs()
+    _get_info()
+    reset()    
+    step()
+    def close():
+        if self.window is not None:
+            pygame.display.quit()
+            pygame.quit()
+    
+    _render_frame() -> returns a single frame representing the current state of the environment. A frame is a np.ndarray with shape (x, y, 3) representing RGB values for an x-by-y pixel image.
+    render() -> returns _render_fram() if self.render_mode == "rgb_array"
+
+    # Abstract method, must be implemented by subclass
+    def compute_reward()
+
+
+make environments in separate files:
+1. class Op3FallControlArms(Op3FallControlEnv)
+2. class Op3FallControlArmsLegs(Op3FallControlEnv)
+3. class Op3FallControlRoll(Op3FallControlEnv)
+
+then register in __init__.py
+from gymnasium.envs.registration import register
+
+register(
+    id="envs/Op3FallControl-v0",
+    entry_point="envs:Op3FallControlArms",
+    max_episode_steps=250 # 5s with 20ms timestep 
+)
+register(
+    id="envs/Op3FallControl-v1",
+    entry_point="envs:Op3FallControlArmsLegs",
+    max_episode_steps=250 # 5s with 20ms timestep
+)
+register(
+    id="envs/Op3FallControl-v2",
+    entry_point="envs:Op3FallControlRoll",
+    max_episode_steps=250 # 5s with 20ms timestep
+)
+
+configuring pyproject.toml. A minimal example of how to do so is as follows:
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gymnasium_env"
+version = "0.0.1"
+dependencies = [
+  "gymnasium",
+  "pygame==2.1.3",
+  "pre-commit",
+]
+
+Now you can install your package locally with:
+
+pip install -e .
+And you can create an instance of the environment via:
+
+# run_gymnasium_env.py
+
+import gymnasium
+import gymnasium_env
+env = gymnasium.make('gymnasium_env/GridWorld-v0')
+
+make curriculum learning
+
+class CurriculumManager()
+    # phase defining methods
+    def enable_mass_rand(bool arms=True, bool legs=False, bool head=False)
+    def enable_joint_offset_rand(float value)
+    def enable_noise(bool imu=False, bool )
+    def enable_push(bool front=True, bool back=False, bool sides=False)
+    def set_push_severity(bool weak=True, bool normal=False, bool strong=False)
+
+    # phase selection
+    def set_phase(int phase_id=0)
+    def to_next_phase()
+
+    # phase defining entry and finish points
+    def start_phase_def(phase_id=0) # starts phase definition
+    def finish_phase_def() # stores values of phase definition components to phases dict with phase_id as key

@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# 3rd party resources
+robotis_op3/
+
 # Run outputs
 outputs/
 
