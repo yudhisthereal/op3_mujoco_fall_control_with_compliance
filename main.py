@@ -18,12 +18,12 @@ except Exception:  # pragma: no cover
 
 
 GOAL_ANGLES: dict[str, float] = {
-	"r_sho_pitch": 1.0,
-	"l_sho_pitch": -1.0,
+	"r_sho_pitch": 1.57,
+	"l_sho_pitch": -1.57,
 	"r_sho_roll": -0.9,
 	"l_sho_roll": 0.9,
-	"r_el": 0.4,
-	"l_el": -0.4,
+	"r_el": 0.8,
+	"l_el": -0.8,
 	"r_hip_pitch": 0.57,
 	"l_hip_pitch": -0.57,
 	"r_knee": -1.5,
@@ -290,8 +290,8 @@ class Op3FallControlEnv(gym.Env):
 			raise ValueError(f"Action shape mismatch: got {action.shape}, expected {self.action_space.shape}")
 
 		# Optional additive action; experiment runner uses zeros.
-		# target = self._target_ctrl + action
-		# self.data.ctrl[self.control_actuator_ids] = target
+		target = self._target_ctrl + action
+		self.data.ctrl[self.control_actuator_ids] = target
 
 		mujoco.mj_step(self.model, self.data)
 		self.step_count += 1
@@ -405,7 +405,7 @@ def run_experiments() -> None:
 	env = Op3FallControlEnv(
 		model_xml=scene_xml,
 		goal_angles=GOAL_ANGLES,
-		render_mode=None,
+		render_mode="human",
 		control_timestep=0.02,
 		camera_distance=1.5,
 		camera_azimuth=160.0,
@@ -421,10 +421,63 @@ def run_experiments() -> None:
 	compliant_m2: list[np.ndarray] = []
 	stiff_m3: list[np.ndarray] = []
 	compliant_m3: list[np.ndarray] = []
+	
+	# NEW: Store final limb Z-positions for each run
+	# Updated with correct limb names from the XML
+	final_limb_positions: dict[str, list[float]] = {
+		# Arms (shoulder/upper arm links)
+		"left_shoulder": [],      # l_sho_pitch_link
+		"right_shoulder": [],     # r_sho_pitch_link
+		"left_upper_arm": [],     # l_sho_roll_link
+		"right_upper_arm": [],    # r_sho_roll_link
+		# Elbows (forearm links)
+		"left_elbow": [],         # l_el_link
+		"right_elbow": [],        # r_el_link
+		# Knees
+		"left_knee": [],          # l_knee_link
+		"right_knee": [],         # r_knee_link
+		# Feet (ankle/foot links)
+		"left_foot": [],          # l_ank_roll_link (last link in left leg chain)
+		"right_foot": [],         # r_ank_roll_link (last link in right leg chain)
+		# Additional useful tracking points
+		"head": [],               # head_tilt_link
+		"torso": [],              # body_link
+		"left_hand": [],          # l_el_link (end of arm chain)
+		"right_hand": []          # r_el_link (end of arm chain)
+	}
+
+	# NEW: Get body IDs for key limbs
+	# Map friendly names to actual body names in the XML
+	body_name_mapping = {
+		"left_shoulder": "l_sho_pitch_link",
+		"right_shoulder": "r_sho_pitch_link",
+		"left_upper_arm": "l_sho_roll_link",
+		"right_upper_arm": "r_sho_roll_link",
+		"left_elbow": "l_el_link",
+		"right_elbow": "r_el_link",
+		"left_knee": "l_knee_link",
+		"right_knee": "r_knee_link",
+		"left_foot": "l_ank_roll_link",
+		"right_foot": "r_ank_roll_link",
+		"head": "head_tilt_link",
+		"torso": "body_link",
+		"left_hand": "l_el_link",      # Same as elbow, but tracked separately
+		"right_hand": "r_el_link"      # Same as elbow, but tracked separately
+	}
+	
+	# Resolve all body IDs
+	body_ids = {}
+	for friendly_name, xml_name in body_name_mapping.items():
+		body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, xml_name)
+		if body_id >= 0:
+			body_ids[friendly_name] = body_id
+			print(f"Found body: {friendly_name} ({xml_name}) with ID: {body_id}")
+		else:
+			print(f"Warning: Could not find body {xml_name} for {friendly_name}")
 
 	try:
 		for run_idx in range(num_runs):
-			compliant_run = (run_idx % 2) == 1
+			compliant_run = True
 			env.reset(seed=base_seed + run_idx)
 			env.set_goal_angles(GOAL_ANGLES)
 			env.apply_gain_scales(gain_cfg.kp_scale_stiff, gain_cfg.kd_scale_stiff, gain_cfg)
@@ -457,6 +510,7 @@ def run_experiments() -> None:
 			restore_started = False
 			restore_step = 0
 			restore_start_step: int | None = None
+
 
 			for step in range(max_steps):
 				# Initial push at head.
@@ -554,7 +608,6 @@ def run_experiments() -> None:
 				fall_speed_list.append(fall_speed)
 				fall_angle_list.append(fall_angle)
 
-				# Restoration condition after loads subside (for compliant runs only).
 				if switched_to_compliance and not restore_started:
 					baseline = float(np.mean(total_list[: impact_cfg.rolling_window])) if len(total_list) >= impact_cfg.rolling_window else float(np.mean(total_list))
 					no_recent_spike = (
@@ -578,6 +631,18 @@ def run_experiments() -> None:
 					restore_step += 1
 
 				last_total = total
+
+			# NEW: Record final limb positions (Z-axis only) at the end of the run
+			if body_ids:
+				for limb_name, body_id in body_ids.items():
+					if body_id >= 0:
+						# Get the body's position in world coordinates
+						z_position = float(env.data.xpos[body_id, 2])  # Z-axis is index 2
+						final_limb_positions[limb_name].append(z_position)
+						print(f"Run {run_idx} - {limb_name} final Z-position: {z_position:.4f}")
+					else:
+						final_limb_positions[limb_name].append(float('nan'))
+						print(f"Run {run_idx} - {limb_name} not found, logging NaN")
 
 			# Per-run plots.
 			t = np.arange(max_steps)
@@ -710,7 +775,6 @@ def run_experiments() -> None:
 
 	finally:
 		env.close()
-
 
 if __name__ == "__main__":
 	run_experiments()
