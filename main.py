@@ -499,8 +499,8 @@ def run_experiments() -> None:
 		# Lightweight summary to terminal.
 		stiff_peaks = [float(np.max(c)) for c in stiff_total]
 		comp_peaks = [float(np.max(c)) for c in compliant_total]
-		stiff_auc = [float(np.trapz(c)) for c in stiff_total]
-		comp_auc = [float(np.trapz(c)) for c in compliant_total]
+		stiff_auc = [float(np.trapezoid(c)) for c in stiff_total]
+		comp_auc = [float(np.trapezoid(c)) for c in compliant_total]
 
 		print("Saved plots to:", out_dir)
 		print(

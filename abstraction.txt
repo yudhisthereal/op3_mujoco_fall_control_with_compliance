@@ -1,14 +1,14 @@
-control timestep 20ms
-mujoco + gymnasium with render mode human, using the same camera angle as in tutorial.ipynb and scene
+[v] control timestep 20ms
+[v] mujoco + gymnasium with render mode human, using the same camera angle as in tutorial.ipynb and scene
 
-make interface for setting stiffness scale and damping scale for compliance, and Clamp gain ranges.    
-push the robot forward at the head at simulation start
-control the robot to move to this joint angles with stiffness scale unchanged:
+[v] make interface for setting stiffness scale and damping scale for compliance, and Clamp gain ranges.    
+[v] push the robot forward at the head at simulation start
+[v] control the robot to move to this joint angles with stiffness scale unchanged:
 "goal_angles": {
-    "r_sho_pitch": 1.0,
-    "l_sho_pitch": -1.0,
-    "r_sho_roll": -0.9,
-    "l_sho_roll": 0.9,
+    "r_sho_pitch": 1.32,
+    "l_sho_pitch": -1.32,
+    "r_sho_roll": -1.1,
+    "l_sho_roll": 1.1,
     "r_el": 0.4,
     "l_el": -0.4,
     "r_hip_pitch": 0.57,
@@ -16,11 +16,12 @@ control the robot to move to this joint angles with stiffness scale unchanged:
     "r_knee": -1.5,
     "l_knee": 1.5
 },
-detect impact by detecting spike in total torque load at runtime, log the total torque loads.
-generate a graph representing the torque load over timesteps
-do that ten times, alternatingly, one should be with stiff joints and the next should be with lowered stiffness scale and increased damping scale after the goal angle is reached (or close to be reached)
-generate an envelope line graph representing the total torque load over timesteps from experiments with vs without compliance.
-try restoring gains over time after torque loads subside
+
+[v] detect impact by detecting spike in total torque load at runtime, log the total torque loads.
+[v] generate a graph representing the torque load over timesteps
+[v] do that ten times, alternatingly, one should be with stiff joints and the next should be with lowered stiffness scale and increased damping scale after the goal angle is reached (or close to be reached)
+[v] try restoring gains over time after torque loads subside
+[ ] generate an envelope line graph representing the total torque load over timesteps from experiments with vs without compliance.
 
 domain randomization for limb masses
 noise perturbation for IMU during training
@@ -28,7 +29,15 @@ make it parallel population training (one policy, many agents)
 
 Scope v1: forward fall, arms only
 
-protective_pose_arms = DECIDE LATER
+protective_pose_arms = {
+    "r_sho_pitch": 1.32,
+    "l_sho_pitch": -1.32,
+    "r_sho_roll": -1.1,
+    "l_sho_roll": 1.1,
+    "r_el": 0.4,
+    "l_el": -0.4,
+}
+
 Reward = -head_impact_velocity(if any) - (joint_angles_arms-protective_pose_arms) - torque_load_after_impact
 
 # gymnasium_envs/op3_fall_control.py
