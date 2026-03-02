@@ -69,7 +69,7 @@ class RestoreConfig:
 
 @dataclass
 class PushConfig:
-	force_xyz: tuple[float, float, float] = (35.0, 0.0, 0.0)
+	force_xyz: tuple[float, float, float] = (25.0, 0.0, 0.0)
 	duration_sec: float = 0.08
 
 
@@ -133,6 +133,11 @@ class Op3FallControlEnv(gym.Env):
 		self.head_body_id = self._resolve_head_body_id()
 		self.step_count = 0
 
+		# Initialize IMU sensor tracking
+		self.imu_sensor_ids = self._find_imu_sensors()
+		self.imu_data_ranges = self._get_imu_data_ranges()
+		print(f"Found {len(self.imu_sensor_ids)} IMU sensors: {list(self.imu_sensor_ids.keys())}")
+
 		# Minimal observation/action spaces for gym compatibility.
 		self.observation_space = spaces.Box(
 			low=-np.inf,
@@ -155,6 +160,75 @@ class Op3FallControlEnv(gym.Env):
 			if body_id >= 0:
 				return body_id
 		raise ValueError("Could not resolve head body for push force.")
+
+	def _find_imu_sensors(self) -> dict[str, int]:
+		"""Find all IMU-related sensors in the model."""
+		imu_sensors = {}
+		for i in range(self.model.nsensor):
+			sensor_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_SENSOR, i)
+			if sensor_name:
+				# Common IMU sensor types in MuJoCo
+				sensor_type = self.model.sensor_type[i]
+				if sensor_type in (
+					mujoco.mjtSensor.mjSENS_ACCELEROMETER,
+					mujoco.mjtSensor.mjSENS_GYRO,
+					mujoco.mjtSensor.mjSENS_MAGNETOMETER,
+					mujoco.mjtSensor.mjSENS_FRAMEQUAT,
+					mujoco.mjtSensor.mjSENS_FRAMELINVEL,
+					mujoco.mjtSensor.mjSENS_FRAMEANGVEL,
+				):
+					imu_sensors[sensor_name] = i
+		return imu_sensors
+
+	def _get_imu_data_ranges(self) -> dict[str, tuple[int, int]]:
+		"""Get the data address ranges for each IMU sensor."""
+		data_ranges = {}
+		for name, sensor_id in self.imu_sensor_ids.items():
+			adr = self.model.sensor_adr[sensor_id]
+			dim = self.model.sensor_dim[sensor_id]
+			data_ranges[name] = (int(adr), int(adr + dim))
+		return data_ranges
+
+	def _read_imu_data(self) -> dict[str, Any]:
+		"""Read all IMU sensor data with detailed component labels."""
+		imu_data = {}
+		for sensor_name, sensor_id in self.imu_sensor_ids.items():
+			sensor_type = self.model.sensor_type[sensor_id]
+			adr_start, adr_end = self.imu_data_ranges[sensor_name]
+			raw_data = self.data.sensordata[adr_start:adr_end]
+			
+			# Label components based on sensor type
+			if sensor_type == mujoco.mjtSensor.mjSENS_ACCELEROMETER:
+				imu_data[f"{sensor_name}_x"] = float(raw_data[0])
+				imu_data[f"{sensor_name}_y"] = float(raw_data[1])
+				imu_data[f"{sensor_name}_z"] = float(raw_data[2])
+			elif sensor_type == mujoco.mjtSensor.mjSENS_GYRO:
+				imu_data[f"{sensor_name}_x"] = float(raw_data[0])
+				imu_data[f"{sensor_name}_y"] = float(raw_data[1])
+				imu_data[f"{sensor_name}_z"] = float(raw_data[2])
+			elif sensor_type == mujoco.mjtSensor.mjSENS_MAGNETOMETER:
+				imu_data[f"{sensor_name}_x"] = float(raw_data[0])
+				imu_data[f"{sensor_name}_y"] = float(raw_data[1])
+				imu_data[f"{sensor_name}_z"] = float(raw_data[2])
+			elif sensor_type == mujoco.mjtSensor.mjSENS_FRAMEQUAT:
+				imu_data[f"{sensor_name}_w"] = float(raw_data[0])
+				imu_data[f"{sensor_name}_x"] = float(raw_data[1])
+				imu_data[f"{sensor_name}_y"] = float(raw_data[2])
+				imu_data[f"{sensor_name}_z"] = float(raw_data[3])
+			elif sensor_type == mujoco.mjtSensor.mjSENS_FRAMELINVEL:
+				imu_data[f"{sensor_name}_x"] = float(raw_data[0])
+				imu_data[f"{sensor_name}_y"] = float(raw_data[1])
+				imu_data[f"{sensor_name}_z"] = float(raw_data[2])
+			elif sensor_type == mujoco.mjtSensor.mjSENS_FRAMEANGVEL:
+				imu_data[f"{sensor_name}_x"] = float(raw_data[0])
+				imu_data[f"{sensor_name}_y"] = float(raw_data[1])
+				imu_data[f"{sensor_name}_z"] = float(raw_data[2])
+			else:
+				# Generic fallback for other sensor types
+				for i, val in enumerate(raw_data):
+					imu_data[f"{sensor_name}_data_{i}"] = float(val)
+				
+		return imu_data
 
 	def _get_obs(self) -> np.ndarray:
 		return np.concatenate([self.data.qpos.copy(), self.data.qvel.copy()])
@@ -230,6 +304,10 @@ class Op3FallControlEnv(gym.Env):
 		info["total_load"] = (
 			info["qfrc_actuator_l1"] + info["qfrc_constraint_l1"] + info["actuator_force_l1"]
 		)
+		
+		# Add IMU readings with detailed component information
+		imu_readings = self._read_imu_data()
+		info.update(imu_readings)
 
 		terminated = False
 		truncated = False
@@ -276,9 +354,11 @@ def run_experiments() -> None:
 	root = Path(__file__).resolve().parent
 	scene_xml = root / "robotis_op3" / "scene.xml"
 	out_dir = root / "outputs"
+	imu_out_dir = out_dir / "IMU" / "experiment_freefall"
+	imu_out_dir.mkdir(parents=True, exist_ok=True)
 	out_dir.mkdir(parents=True, exist_ok=True)
 
-	num_runs = 10
+	num_runs = 2
 	max_steps = 50
 	base_seed = 1234
 
@@ -322,6 +402,13 @@ def run_experiments() -> None:
 			m3_list: list[float] = []
 			total_list: list[float] = []
 			spike_flags: list[bool] = []
+			
+			# IMU data storage
+			imu_accel_data = {"x": [], "y": [], "z": []}
+			imu_gyro_data = {"x": [], "y": [], "z": []}
+			imu_quat_data = {"w": [], "x": [], "y": [], "z": []}
+			imu_linvel_data = {"x": [], "y": [], "z": []}
+			imu_angvel_data = {"x": [], "y": [], "z": []}
 
 			goal_count = 0
 			goal_reached_step: int | None = None
@@ -356,6 +443,34 @@ def run_experiments() -> None:
 				m2_list.append(m2)
 				m3_list.append(m3)
 				total_list.append(total)
+				
+				# Store IMU data
+				imu_accel_data["x"].append(info.get("torso_accel_x", 0.0))
+				imu_accel_data["y"].append(info.get("torso_accel_y", 0.0))
+				imu_accel_data["z"].append(info.get("torso_accel_z", 0.0))
+				imu_gyro_data["x"].append(info.get("torso_gyro_x", 0.0))
+				imu_gyro_data["y"].append(info.get("torso_gyro_y", 0.0))
+				imu_gyro_data["z"].append(info.get("torso_gyro_z", 0.0))
+				imu_quat_data["w"].append(info.get("torso_quat_w", 0.0))
+				imu_quat_data["x"].append(info.get("torso_quat_x", 0.0))
+				imu_quat_data["y"].append(info.get("torso_quat_y", 0.0))
+				imu_quat_data["z"].append(info.get("torso_quat_z", 0.0))
+				imu_linvel_data["x"].append(info.get("torso_linvel_x", 0.0))
+				imu_linvel_data["y"].append(info.get("torso_linvel_y", 0.0))
+				imu_linvel_data["z"].append(info.get("torso_linvel_z", 0.0))
+				imu_angvel_data["x"].append(info.get("torso_angvel_x", 0.0))
+				imu_angvel_data["y"].append(info.get("torso_angvel_y", 0.0))
+				imu_angvel_data["z"].append(info.get("torso_angvel_z", 0.0))
+				
+				# Log IMU readings to console
+				if step % 10 == 0:  # Log every 10 steps to avoid spam
+					imu_keys = [k for k in info.keys() if "accel" in k or "gyro" in k or "mag" in k or "quat" in k or "vel" in k or "data_" in k]
+					if imu_keys:
+						print(f"\nStep {step} - IMU Data:")
+						for key in imu_keys:
+							print(f"  {key}: {info[key]:.6f}")
+					else:
+						print(f"\nStep {step}: No IMU data found in info dict")
 
 				# Moderate goal gate.
 				err = env.get_goal_errors()
@@ -441,6 +556,61 @@ def run_experiments() -> None:
 			ax[0].set_title(f"Run {run_idx}: {'compliant-after-goal' if compliant_run else 'stiff'}")
 			fig.tight_layout()
 			fig.savefig(out_dir / f"run_{run_idx:02d}_loads.png", dpi=150)
+			plt.close(fig)
+
+			# Plot IMU data for this run
+			t = np.arange(max_steps)
+			fig, axs = plt.subplots(5, 1, figsize=(12, 14), sharex=True)
+
+			# Accelerometer
+			axs[0].plot(t, imu_accel_data["x"], label="x", color="tab:red")
+			axs[0].plot(t, imu_accel_data["y"], label="y", color="tab:green")
+			axs[0].plot(t, imu_accel_data["z"], label="z", color="tab:blue")
+			axs[0].set_title(f"Run {run_idx}: Acceleration (m/s²)")
+			axs[0].set_ylabel("Accel (m/s²)")
+			axs[0].grid(True, alpha=0.3)
+			axs[0].legend(loc="upper right")
+
+			# Gyroscope
+			axs[1].plot(t, imu_gyro_data["x"], label="x", color="tab:red")
+			axs[1].plot(t, imu_gyro_data["y"], label="y", color="tab:green")
+			axs[1].plot(t, imu_gyro_data["z"], label="z", color="tab:blue")
+			axs[1].set_title("Gyroscope (rad/s)")
+			axs[1].set_ylabel("Gyro (rad/s)")
+			axs[1].grid(True, alpha=0.3)
+			axs[1].legend(loc="upper right")
+
+			# Quaternion
+			axs[2].plot(t, imu_quat_data["w"], label="w", color="tab:purple")
+			axs[2].plot(t, imu_quat_data["x"], label="x", color="tab:red")
+			axs[2].plot(t, imu_quat_data["y"], label="y", color="tab:green")
+			axs[2].plot(t, imu_quat_data["z"], label="z", color="tab:blue")
+			axs[2].set_title("Quaternion (orientation)")
+			axs[2].set_ylabel("Quat")
+			axs[2].grid(True, alpha=0.3)
+			axs[2].legend(loc="upper right")
+
+			# Linear Velocity
+			axs[3].plot(t, imu_linvel_data["x"], label="x", color="tab:red")
+			axs[3].plot(t, imu_linvel_data["y"], label="y", color="tab:green")
+			axs[3].plot(t, imu_linvel_data["z"], label="z", color="tab:blue")
+			axs[3].set_title("Linear Velocity (m/s)")
+			axs[3].set_ylabel("LinVel (m/s)")
+			axs[3].grid(True, alpha=0.3)
+			axs[3].legend(loc="upper right")
+
+			# Angular Velocity
+			axs[4].plot(t, imu_angvel_data["x"], label="x", color="tab:red")
+			axs[4].plot(t, imu_angvel_data["y"], label="y", color="tab:green")
+			axs[4].plot(t, imu_angvel_data["z"], label="z", color="tab:blue")
+			axs[4].set_title("Angular Velocity (rad/s)")
+			axs[4].set_ylabel("AngVel (rad/s)")
+			axs[4].set_xlabel("Timestep")
+			axs[4].grid(True, alpha=0.3)
+			axs[4].legend(loc="upper right")
+
+			fig.tight_layout()
+			fig.savefig(imu_out_dir / f"run_{run_idx:02d}_imu.png", dpi=150)
 			plt.close(fig)
 
 			m1_arr = np.array(m1_list)

@@ -20,14 +20,18 @@
 [v] detect impact by detecting spike in total torque load at runtime, log the total torque loads.
 [v] generate a graph representing the torque load over timesteps
 [v] do that ten times, alternatingly, one should be with stiff joints and the next should be with lowered stiffness scale and increased damping scale after the goal angle is reached (or close to be reached)
-[v] try restoring gains over time after torque loads subside
-[ ] generate an envelope line graph representing the total torque load over timesteps from experiments with vs without compliance.
-
-domain randomization for limb masses
-noise perturbation for IMU during training
-make it parallel population training (one policy, many agents)
+[v] try restoring gains over time after torque loads subside 
+[v] generate an envelope line graph representing the total torque load over timesteps from experiments with vs without compliance.
 
 Scope v1: forward fall, arms only
+Alg: PPO (form stablebaselines3)
+[ ] domain randomization for limb masses
+[ ] noise perturbation for IMU during training
+[ ] make it parallel population training (one policy, many agents)
+[ ] output a recorded video of the simulation every 100th episode (training should be headless)
+[ ] output a checkpoint model every 100th episode
+[ ] organize every training run into runs/<timestamp>/ folder. remove outputs folder
+[ ] how to trigger reduced stiffness and increased damping
 
 protective_pose_arms = {
     "r_sho_pitch": 1.32,
@@ -38,34 +42,32 @@ protective_pose_arms = {
     "l_el": -0.4,
 }
 
-Reward = -head_impact_velocity(if any) - (joint_angles_arms-protective_pose_arms) - torque_load_after_impact
+Reward = -head_impact_velocity(if any) -torque_load_on_impact
 
 # gymnasium_envs/op3_fall_control.py
 class Op3FallControlEnv(gymnaisum.Env)
 
-    # Observation space settings
+    # Observation space configurations (these add components to observation space)
     # values should be normalized
-    def obs_joint(List joint_names, bool angle=True, bool torque_load=True)
-    def obs_fall_vel() -> continuous fall velocity
+    def obs_joint(List joint_names, bool angle=True, bool velocity=True)
+    def obs_fall_vel() -> continuous fall_speed = sqrt(wx² + wy²)
     def obs_fall_vel_discrete() -> {NORMAL/FAST}
-    def obs_fall_angle() -> radians, where 0 is front, to the right is positive, and to the left is negative
+    def obs_fall_angle() -> radians, fall_angle = atan2(wx, wy)
     def obs_fall_angle_discrete(int dirs=FallAngle.FOUR) -> {F/B/L/R/}, else if dirs==FallAngle.EIGHT {F/B/L/R/FL/FR/BL/BR}
-    def obs_kp() -> proportional gain of PD controller
-    def obs_kd() -> derivative gain of PD controller
 
-    # Action space settings
+    # Action space configurations (these add components to action space)
     # action output values should be normalized
-    def act_joint(List joint_names) -> adds positional joint control, with target_q = current_q + angle_delta (controls value of angle_delta)
-    def act_kp() -> adds kp control (absolute continuous value >= 0)
-    def act_kd() -> adds kd control (absolute continuous value >= 0)
-    def act_kp_rel() -> adds kp control (relative continuous value, kp can't be below 0)
-    def act_kd_rel() -> adds kd control (relative continuous value, kd can't be below 0)
+    def act_joint_pos(List joint_names) -> outputs angle_delta (target_q = current_q + angle_delta)
+    def act_joint_delta(List joint_names) -> outputs target_q
     
     # Core function
     _get_obs()
     _get_info()
+    _apply_action()
     reset()    
     step()
+    get_obs_dim()
+    get_act_dim()
     def close():
         if self.window is not None:
             pygame.display.quit()
@@ -79,9 +81,9 @@ class Op3FallControlEnv(gymnaisum.Env)
 
 
 make environments in separate files:
-1. class Op3FallControlArms(Op3FallControlEnv)
-2. class Op3FallControlArmsLegs(Op3FallControlEnv)
-3. class Op3FallControlRoll(Op3FallControlEnv)
+[ ] 1. class Op3FallControlArms(Op3FallControlEnv)
+[ ] 2. class Op3FallControlArmsLegs(Op3FallControlEnv)
+[ ] 3. class Op3FallControlRoll(Op3FallControlEnv)
 
 then register in __init__.py
 from gymnasium.envs.registration import register
@@ -145,3 +147,13 @@ class CurriculumManager()
     # phase defining entry and finish points
     def start_phase_def(phase_id=0) # starts phase definition
     def finish_phase_def() # stores values of phase definition components to phases dict with phase_id as key
+
+PHASES:
+1. slight push (20N)
+2. normal push (35N)
+3. strong push (50N)
+
+TRAINING SCENARIOS
+for each of (arm-only, arms-legs, and roll)
+1. discretized obs
+2. continuous obs
