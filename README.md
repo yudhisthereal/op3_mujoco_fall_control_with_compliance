@@ -44,7 +44,10 @@ The `robotis_op3/` folder contains the MJCF model, XML scene, and collision mesh
 git clone https://github.com/google-deepmind/mujoco_menagerie.git
 
 # Copy just the OP3 folder to your project root
-cp -r mujoco_menagerie/robotis_op3 /path/to/op3_mujoco_arm_to_fall_direction/
+cp -r mujoco_menagerie/robotis_op3 /path/to/op3_mujoco_fall_control_with_compliance/
+
+# IMPORTANT: Copy the modified op3.xml from this repo
+cp robotis_op3/op3.xml /path/to/op3_mujoco_fall_control_with_compliance/robotis_op3/op3.xml
 ```
 
 ### Option 2: Sparse Checkout (Efficient, Only Downloads OP3)
@@ -70,8 +73,14 @@ git fetch --depth 1 origin main
 git checkout origin/main
 
 # Copy to your project
-cp -r robotis_op3 /path/to/op3_mujoco_arm_to_fall_direction/
+cp -r robotis_op3 /path/to/op3_mujoco_fall_control_with_compliance/
+
+# IMPORTANT: Copy the modified op3.xml from this repo (overwrites menagerie version)
+cp op3_custom.xml \
+   /path/to/robotis_op3/op3.xml
 ```
+
+> **Important**: This project uses a **modified version** of `op3.xml` called `op3_custom.xml` with custom sensors and site models for hands. Copy the contents of `op3_custom.xml` to overwrite the menagerie's default version after copying the folder structure and assets.
 
 > **Tip**: Option 2 downloads ~50 MB instead of the full ~500+ MB repo. Use this if bandwidth is a concern.
 
