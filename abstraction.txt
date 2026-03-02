@@ -138,7 +138,7 @@ class CurriculumManager()
     def enable_joint_offset_rand(float value)
     def enable_noise(bool imu=False, bool )
     def enable_push(bool front=True, bool back=False, bool sides=False)
-    def set_push_severity(bool weak=True, bool normal=False, bool strong=False)
+    def set_push_severity(bool weak=False, bool normal=False, bool strong=False) --> throws exception if all three are False
 
     # phase selection
     def set_phase(int phase_id=0)
@@ -157,3 +157,7 @@ TRAINING SCENARIOS
 for each of (arm-only, arms-legs, and roll)
 1. discretized obs
 2. continuous obs
+
+OBS and ACT combinations
+1.  OBS: joint_pos, joint_vel, 
+    ACT:

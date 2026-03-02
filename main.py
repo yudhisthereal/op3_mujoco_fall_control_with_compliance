@@ -290,8 +290,8 @@ class Op3FallControlEnv(gym.Env):
 			raise ValueError(f"Action shape mismatch: got {action.shape}, expected {self.action_space.shape}")
 
 		# Optional additive action; experiment runner uses zeros.
-		target = self._target_ctrl + action
-		self.data.ctrl[self.control_actuator_ids] = target
+		# target = self._target_ctrl + action
+		# self.data.ctrl[self.control_actuator_ids] = target
 
 		mujoco.mj_step(self.model, self.data)
 		self.step_count += 1
@@ -350,6 +350,40 @@ def compute_envelope(curves: list[np.ndarray]) -> dict[str, np.ndarray]:
 	}
 
 
+def _normalize_2d(v: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+	n = float(np.linalg.norm(v))
+	if n < eps:
+		return np.zeros(2, dtype=np.float64)
+	return v / n
+
+
+def _estimate_fall_direction_vector(
+	quat_wxyz: np.ndarray,
+	linvel_xy: np.ndarray,
+	alpha_tilt: float = 0.85,
+) -> np.ndarray:
+	"""Estimate fall direction on ground plane from torso tilt + horizontal velocity."""
+	w, x, y, z = quat_wxyz
+
+	# Body +Z axis expressed in world frame from quaternion.
+	up_x = 2.0 * (x * z + w * y)
+	up_y = 2.0 * (y * z - w * x)
+
+	# Ground-plane fall direction points opposite to projected up vector.
+	v_tilt = _normalize_2d(np.array([-up_x, -up_y], dtype=np.float64))
+	v_vel = _normalize_2d(linvel_xy.astype(np.float64, copy=False))
+
+	if np.allclose(v_tilt, 0.0) and np.allclose(v_vel, 0.0):
+		return np.zeros(2, dtype=np.float64)
+	if np.allclose(v_tilt, 0.0):
+		return v_vel
+	if np.allclose(v_vel, 0.0):
+		return v_tilt
+
+	v = alpha_tilt * v_tilt + (1.0 - alpha_tilt) * v_vel
+	return _normalize_2d(v)
+
+
 def run_experiments() -> None:
 	root = Path(__file__).resolve().parent
 	scene_xml = root / "robotis_op3" / "scene.xml"
@@ -358,7 +392,7 @@ def run_experiments() -> None:
 	imu_out_dir.mkdir(parents=True, exist_ok=True)
 	out_dir.mkdir(parents=True, exist_ok=True)
 
-	num_runs = 2
+	num_runs = 1
 	max_steps = 50
 	base_seed = 1234
 
@@ -371,7 +405,7 @@ def run_experiments() -> None:
 	env = Op3FallControlEnv(
 		model_xml=scene_xml,
 		goal_angles=GOAL_ANGLES,
-		render_mode="human",
+		render_mode=None,
 		control_timestep=0.02,
 		camera_distance=1.5,
 		camera_azimuth=160.0,
@@ -403,12 +437,12 @@ def run_experiments() -> None:
 			total_list: list[float] = []
 			spike_flags: list[bool] = []
 			
-			# IMU data storage
-			imu_accel_data = {"x": [], "y": [], "z": []}
-			imu_gyro_data = {"x": [], "y": [], "z": []}
-			imu_quat_data = {"w": [], "x": [], "y": [], "z": []}
-			imu_linvel_data = {"x": [], "y": [], "z": []}
-			imu_angvel_data = {"x": [], "y": [], "z": []}
+			# Fall dynamics tracking
+			fall_speed_list: list[float] = []
+			fall_angle_list: list[float] = []
+			fall_vec_filt = np.array([0.0, 0.0], dtype=np.float64)
+			fall_angle_locked: float | None = None
+			fall_lock_active = False
 
 			goal_count = 0
 			goal_reached_step: int | None = None
@@ -443,34 +477,11 @@ def run_experiments() -> None:
 				m2_list.append(m2)
 				m3_list.append(m3)
 				total_list.append(total)
-				
-				# Store IMU data
-				imu_accel_data["x"].append(info.get("torso_accel_x", 0.0))
-				imu_accel_data["y"].append(info.get("torso_accel_y", 0.0))
-				imu_accel_data["z"].append(info.get("torso_accel_z", 0.0))
-				imu_gyro_data["x"].append(info.get("torso_gyro_x", 0.0))
-				imu_gyro_data["y"].append(info.get("torso_gyro_y", 0.0))
-				imu_gyro_data["z"].append(info.get("torso_gyro_z", 0.0))
-				imu_quat_data["w"].append(info.get("torso_quat_w", 0.0))
-				imu_quat_data["x"].append(info.get("torso_quat_x", 0.0))
-				imu_quat_data["y"].append(info.get("torso_quat_y", 0.0))
-				imu_quat_data["z"].append(info.get("torso_quat_z", 0.0))
-				imu_linvel_data["x"].append(info.get("torso_linvel_x", 0.0))
-				imu_linvel_data["y"].append(info.get("torso_linvel_y", 0.0))
-				imu_linvel_data["z"].append(info.get("torso_linvel_z", 0.0))
-				imu_angvel_data["x"].append(info.get("torso_angvel_x", 0.0))
-				imu_angvel_data["y"].append(info.get("torso_angvel_y", 0.0))
-				imu_angvel_data["z"].append(info.get("torso_angvel_z", 0.0))
-				
-				# Log IMU readings to console
-				if step % 10 == 0:  # Log every 10 steps to avoid spam
-					imu_keys = [k for k in info.keys() if "accel" in k or "gyro" in k or "mag" in k or "quat" in k or "vel" in k or "data_" in k]
-					if imu_keys:
-						print(f"\nStep {step} - IMU Data:")
-						for key in imu_keys:
-							print(f"  {key}: {info[key]:.6f}")
-					else:
-						print(f"\nStep {step}: No IMU data found in info dict")
+
+				# Keep original fall-speed definition from angular velocity.
+				wx = float(info.get("torso_angvel_x", 0.0))
+				wy = float(info.get("torso_angvel_y", 0.0))
+				fall_speed = float(np.sqrt(wx**2 + wy**2))
 
 				# Moderate goal gate.
 				err = env.get_goal_errors()
@@ -508,6 +519,40 @@ def run_experiments() -> None:
 				rolling.append(total)
 				spike_flags.append(is_spike)
 				refractory = max(0, refractory - 1)
+
+				# Robust fall-angle estimate (tilt + velocity, filtered, and locked on impact).
+				if not fall_lock_active:
+					qw = float(info.get("torso_quat_w", 1.0))
+					qx = float(info.get("torso_quat_x", 0.0))
+					qy = float(info.get("torso_quat_y", 0.0))
+					qz = float(info.get("torso_quat_z", 0.0))
+					q = np.array([qw, qx, qy, qz], dtype=np.float64)
+					q_norm = float(np.linalg.norm(q))
+					if q_norm > 1e-9:
+						q = q / q_norm
+
+					vx = float(info.get("torso_linvel_x", 0.0))
+					vy = float(info.get("torso_linvel_y", 0.0))
+					v_inst = _estimate_fall_direction_vector(q, np.array([vx, vy], dtype=np.float64), alpha_tilt=0.85)
+
+					beta = 0.12
+					fall_vec_filt = (1.0 - beta) * fall_vec_filt + beta * v_inst
+					fall_vec_filt = _normalize_2d(fall_vec_filt)
+
+					if is_spike and float(np.linalg.norm(fall_vec_filt)) > 1e-6:
+						fall_angle_locked = float(np.arctan2(fall_vec_filt[1], fall_vec_filt[0]))
+						fall_lock_active = True
+
+				if fall_lock_active and fall_angle_locked is not None:
+					fall_angle = fall_angle_locked
+				else:
+					if float(np.linalg.norm(fall_vec_filt)) > 1e-6:
+						fall_angle = float(np.arctan2(fall_vec_filt[1], fall_vec_filt[0]))
+					else:
+						fall_angle = 0.0
+
+				fall_speed_list.append(fall_speed)
+				fall_angle_list.append(fall_angle)
 
 				# Restoration condition after loads subside (for compliant runs only).
 				if switched_to_compliance and not restore_started:
@@ -558,59 +603,27 @@ def run_experiments() -> None:
 			fig.savefig(out_dir / f"run_{run_idx:02d}_loads.png", dpi=150)
 			plt.close(fig)
 
-			# Plot IMU data for this run
+			# Plot fall dynamics (fall speed and fall angle)
 			t = np.arange(max_steps)
-			fig, axs = plt.subplots(5, 1, figsize=(12, 14), sharex=True)
+			fig, axs = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
 
-			# Accelerometer
-			axs[0].plot(t, imu_accel_data["x"], label="x", color="tab:red")
-			axs[0].plot(t, imu_accel_data["y"], label="y", color="tab:green")
-			axs[0].plot(t, imu_accel_data["z"], label="z", color="tab:blue")
-			axs[0].set_title(f"Run {run_idx}: Acceleration (m/s²)")
-			axs[0].set_ylabel("Accel (m/s²)")
+			# Fall speed
+			axs[0].plot(t, fall_speed_list, label="fall_speed", color="tab:red", linewidth=2)
+			axs[0].set_title(f"Run {run_idx}: Fall Speed = sqrt(wx² + wy²)")
+			axs[0].set_ylabel("Fall Speed (rad/s)")
 			axs[0].grid(True, alpha=0.3)
 			axs[0].legend(loc="upper right")
 
-			# Gyroscope
-			axs[1].plot(t, imu_gyro_data["x"], label="x", color="tab:red")
-			axs[1].plot(t, imu_gyro_data["y"], label="y", color="tab:green")
-			axs[1].plot(t, imu_gyro_data["z"], label="z", color="tab:blue")
-			axs[1].set_title("Gyroscope (rad/s)")
-			axs[1].set_ylabel("Gyro (rad/s)")
+			# Fall angle
+			axs[1].plot(t, fall_angle_list, label="fall_angle", color="tab:blue", linewidth=2)
+			axs[1].set_title("Fall Angle (robust): filtered tilt/velocity, locked at impact")
+			axs[1].set_ylabel("Fall Angle (radians)")
+			axs[1].set_xlabel("Timestep")
 			axs[1].grid(True, alpha=0.3)
 			axs[1].legend(loc="upper right")
 
-			# Quaternion
-			axs[2].plot(t, imu_quat_data["w"], label="w", color="tab:purple")
-			axs[2].plot(t, imu_quat_data["x"], label="x", color="tab:red")
-			axs[2].plot(t, imu_quat_data["y"], label="y", color="tab:green")
-			axs[2].plot(t, imu_quat_data["z"], label="z", color="tab:blue")
-			axs[2].set_title("Quaternion (orientation)")
-			axs[2].set_ylabel("Quat")
-			axs[2].grid(True, alpha=0.3)
-			axs[2].legend(loc="upper right")
-
-			# Linear Velocity
-			axs[3].plot(t, imu_linvel_data["x"], label="x", color="tab:red")
-			axs[3].plot(t, imu_linvel_data["y"], label="y", color="tab:green")
-			axs[3].plot(t, imu_linvel_data["z"], label="z", color="tab:blue")
-			axs[3].set_title("Linear Velocity (m/s)")
-			axs[3].set_ylabel("LinVel (m/s)")
-			axs[3].grid(True, alpha=0.3)
-			axs[3].legend(loc="upper right")
-
-			# Angular Velocity
-			axs[4].plot(t, imu_angvel_data["x"], label="x", color="tab:red")
-			axs[4].plot(t, imu_angvel_data["y"], label="y", color="tab:green")
-			axs[4].plot(t, imu_angvel_data["z"], label="z", color="tab:blue")
-			axs[4].set_title("Angular Velocity (rad/s)")
-			axs[4].set_ylabel("AngVel (rad/s)")
-			axs[4].set_xlabel("Timestep")
-			axs[4].grid(True, alpha=0.3)
-			axs[4].legend(loc="upper right")
-
 			fig.tight_layout()
-			fig.savefig(imu_out_dir / f"run_{run_idx:02d}_imu.png", dpi=150)
+			fig.savefig(imu_out_dir / f"run_{run_idx:02d}_fall_dynamics.png", dpi=150)
 			plt.close(fig)
 
 			m1_arr = np.array(m1_list)
@@ -629,42 +642,45 @@ def run_experiments() -> None:
 				stiff_total.append(total_arr)
 
 		# Envelope plots (stiff vs compliant) for all requested metrics + total.
-		metric_pairs = [
-			("qfrc_actuator", stiff_m1, compliant_m1),
-			("qfrc_constraint", stiff_m2, compliant_m2),
-			("actuator_force", stiff_m3, compliant_m3),
-			("total_load", stiff_total, compliant_total),
-		]
+		if num_runs > 1 and stiff_total and compliant_total:
+			metric_pairs = [
+				("qfrc_actuator", stiff_m1, compliant_m1),
+				("qfrc_constraint", stiff_m2, compliant_m2),
+				("actuator_force", stiff_m3, compliant_m3),
+				("total_load", stiff_total, compliant_total),
+			]
 
-		fig, axs = plt.subplots(4, 2, figsize=(14, 16), sharex=True)
-		x = np.arange(max_steps)
-		for row, (name, stiff_curves, comp_curves) in enumerate(metric_pairs):
-			stiff_env = compute_envelope(stiff_curves)
-			comp_env = compute_envelope(comp_curves)
+			fig, axs = plt.subplots(4, 2, figsize=(14, 16), sharex=True)
+			x = np.arange(max_steps)
+			for row, (name, stiff_curves, comp_curves) in enumerate(metric_pairs):
+				stiff_env = compute_envelope(stiff_curves)
+				comp_env = compute_envelope(comp_curves)
 
-			axs[row, 0].plot(x, stiff_env["median"], color="tab:blue", label="median")
-			axs[row, 0].fill_between(x, stiff_env["p10"], stiff_env["p90"], color="tab:blue", alpha=0.2, label="p10-p90")
-			axs[row, 0].set_title(f"Stiff: {name}")
-			axs[row, 0].grid(True, alpha=0.3)
-			axs[row, 0].legend(loc="upper right")
+				axs[row, 0].plot(x, stiff_env["median"], color="tab:blue", label="median")
+				axs[row, 0].fill_between(x, stiff_env["p10"], stiff_env["p90"], color="tab:blue", alpha=0.2, label="p10-p90")
+				axs[row, 0].set_title(f"Stiff: {name}")
+				axs[row, 0].grid(True, alpha=0.3)
+				axs[row, 0].legend(loc="upper right")
 
-			axs[row, 1].plot(x, comp_env["median"], color="tab:purple", label="median")
-			axs[row, 1].fill_between(x, comp_env["p10"], comp_env["p90"], color="tab:purple", alpha=0.2, label="p10-p90")
-			axs[row, 1].set_title(f"Compliant-after-goal: {name}")
-			axs[row, 1].grid(True, alpha=0.3)
-			axs[row, 1].legend(loc="upper right")
+				axs[row, 1].plot(x, comp_env["median"], color="tab:purple", label="median")
+				axs[row, 1].fill_between(x, comp_env["p10"], comp_env["p90"], color="tab:purple", alpha=0.2, label="p10-p90")
+				axs[row, 1].set_title(f"Compliant-after-goal: {name}")
+				axs[row, 1].grid(True, alpha=0.3)
+				axs[row, 1].legend(loc="upper right")
 
-			# Keep y-scale aligned per metric row for easier comparison.
-			y_min = min(float(np.min(stiff_env["p10"])), float(np.min(comp_env["p10"])))
-			y_max = max(float(np.max(stiff_env["p90"])), float(np.max(comp_env["p90"])))
-			axs[row, 0].set_ylim(y_min, y_max)
-			axs[row, 1].set_ylim(y_min, y_max)
+				# Keep y-scale aligned per metric row for easier comparison.
+				y_min = min(float(np.min(stiff_env["p10"])), float(np.min(comp_env["p10"])))
+				y_max = max(float(np.max(stiff_env["p90"])), float(np.max(comp_env["p90"])))
+				axs[row, 0].set_ylim(y_min, y_max)
+				axs[row, 1].set_ylim(y_min, y_max)
 
-		axs[-1, 0].set_xlabel("Timestep")
-		axs[-1, 1].set_xlabel("Timestep")
-		fig.tight_layout()
-		fig.savefig(out_dir / "envelope_stiff_vs_compliant.png", dpi=150)
-		plt.close(fig)
+			axs[-1, 0].set_xlabel("Timestep")
+			axs[-1, 1].set_xlabel("Timestep")
+			fig.tight_layout()
+			fig.savefig(out_dir / "envelope_stiff_vs_compliant.png", dpi=150)
+			plt.close(fig)
+		else:
+			print("Skipping envelope plot: need at least 2 runs with both stiff and compliant cohorts.")
 
 		# Lightweight summary to terminal.
 		stiff_peaks = [float(np.max(c)) for c in stiff_total]
@@ -672,19 +688,25 @@ def run_experiments() -> None:
 		stiff_auc = [float(np.trapezoid(c)) for c in stiff_total]
 		comp_auc = [float(np.trapezoid(c)) for c in compliant_total]
 
+		stiff_peak_median = float(np.median(stiff_peaks)) if stiff_peaks else None
+		comp_peak_median = float(np.median(comp_peaks)) if comp_peaks else None
+		stiff_auc_median = float(np.median(stiff_auc)) if stiff_auc else None
+		comp_auc_median = float(np.median(comp_auc)) if comp_auc else None
+
+		peak_summary = (
+			f"{stiff_peak_median:.6f} / {comp_peak_median:.6f}"
+			if (stiff_peak_median is not None and comp_peak_median is not None)
+			else "N/A (need both stiff and compliant runs)"
+		)
+		auc_summary = (
+			f"{stiff_auc_median:.6f} / {comp_auc_median:.6f}"
+			if (stiff_auc_median is not None and comp_auc_median is not None)
+			else "N/A (need both stiff and compliant runs)"
+		)
+
 		print("Saved plots to:", out_dir)
-		print(
-			"Median peak total_load (stiff/compliant):",
-			float(np.median(stiff_peaks)),
-			"/",
-			float(np.median(comp_peaks)),
-		)
-		print(
-			"Median AUC total_load (stiff/compliant):",
-			float(np.median(stiff_auc)),
-			"/",
-			float(np.median(comp_auc)),
-		)
+		print("Median peak total_load (stiff/compliant):", peak_summary)
+		print("Median AUC total_load (stiff/compliant):", auc_summary)
 
 	finally:
 		env.close()
