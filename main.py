@@ -2,14 +2,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Dict, List, Tuple
 from collections import deque
+from datetime import datetime
 
 import gymnasium as gym
 from gymnasium import spaces
 import matplotlib.pyplot as plt
 import mujoco
 import numpy as np
+
+try:
+	from stable_baselines3 import PPO
+	from stable_baselines3.common.callbacks import BaseCallback
+	from stable_baselines3.common.monitor import Monitor
+	from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecVideoRecorder
+except Exception:  # pragma: no cover
+	PPO = None
+	BaseCallback = object  # type: ignore[assignment]
+	Monitor = None
+	DummyVecEnv = None
+	SubprocVecEnv = None
+	VecVideoRecorder = None
 
 try:
 	import mujoco.viewer as mj_viewer
@@ -79,6 +93,30 @@ class TimeToImpactConfig:
 	eps: float = 1e-6  # Epsilon for avoiding division by zero
 
 
+@dataclass
+class RewardConfig:
+	w_head: float = 1.0
+	w_torque: float = 0.5
+	w_speed: float = 0.1
+	max_head_vel: float = 5.0
+	max_torque: float = 500.0
+	max_fall_speed: float = 10.0
+
+
+@dataclass
+class RLTrainingConfig:
+	total_timesteps: int = 200_000
+	max_episode_steps: int = 250
+	n_envs: int = 8
+	checkpoint_interval_episodes: int = 100
+	video_interval_episodes: int = 100
+	n_steps: int = 2048
+	batch_size: int = 256
+	learning_rate: float = 3e-4
+	gamma: float = 0.99
+	gae_lambda: float = 0.95
+
+
 class Op3FallControlEnv(gym.Env):
 	metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
 
@@ -135,6 +173,7 @@ class Op3FallControlEnv(gym.Env):
 
 		self.current_kp_scale = 1.0
 		self.current_kd_scale = 1.0
+		self.is_in_compliant_mode = False
 
 		self.head_body_id = self._resolve_head_body_id()
 		self.step_count = 0
@@ -338,6 +377,10 @@ class Op3FallControlEnv(gym.Env):
 
 		self.current_kp_scale = kp_scale
 		self.current_kd_scale = kd_scale
+		self.is_in_compliant_mode = (
+			abs(kp_scale - gain_cfg.kp_scale_compliant) < 1e-6
+			and abs(kd_scale - gain_cfg.kd_scale_compliant) < 1e-6
+		)
 
 	def get_goal_errors(self) -> np.ndarray:
 		current = self.data.qpos[self.control_qpos_ids]
@@ -472,7 +515,7 @@ def run_experiments() -> None:
 	out_dir.mkdir(parents=True, exist_ok=True)
 
 	num_runs = 4
-	max_steps = 500
+	max_steps = 125
 	base_seed = 1234
 
 	gain_cfg = GainConfig()
@@ -811,5 +854,398 @@ def run_experiments() -> None:
 	finally:
 		env.close()
 
+class Op3FallControlArmsRL(gym.Env):
+	"""RL wrapper around Op3FallControlEnv for forward-fall, arms-only PPO training."""
+
+	metadata = {"render_modes": ["rgb_array"], "render_fps": 50}
+
+	def __init__(
+		self,
+		model_xml: str | Path,
+		goal_angles: dict[str, float],
+		reward_cfg: RewardConfig | None = None,
+		max_episode_steps: int = 250,
+		seed: int | None = None,
+	) -> None:
+		super().__init__()
+		self.reward_cfg = reward_cfg or RewardConfig()
+		self.max_episode_steps = max_episode_steps
+		self._episode_step = 0
+		# Ensure Gym / SB3 see this env as rgb_array-only for recording.
+		self.render_mode = "rgb_array"
+
+		self.gain_cfg = GainConfig()
+		self.push_cfg = PushConfig()
+		self.tti_cfg = TimeToImpactConfig()
+		self._switched_to_compliance = False
+		self._push_steps = 0
+
+		self.core_env = Op3FallControlEnv(
+			model_xml=model_xml,
+			goal_angles=goal_angles,
+			render_mode="rgb_array",
+			control_timestep=0.02,
+			camera_distance=1.5,
+			camera_azimuth=160.0,
+			camera_elevation=-20.0,
+		)
+
+		if seed is not None:
+			self.core_env.reset(seed=seed)
+
+		self.control_joint_names = list(goal_angles.keys())
+		self._joint_indices = [self.core_env.qpos_ids[n] for n in self.control_joint_names]
+		self._dof_indices = [self.core_env.dof_ids[n] for n in self.control_joint_names]
+
+		# Action: normalized joint position deltas in [-1, 1] for each controlled joint.
+		self.max_joint_delta = np.array([0.2] * len(self.control_joint_names), dtype=np.float64)
+		self.action_space = spaces.Box(
+			low=-1.0,
+			high=1.0,
+			shape=(len(self.control_joint_names),),
+			dtype=np.float32,
+		)
+
+		# Observation components:
+		# - joint angles (arms + hips/knees used in GOAL_ANGLES)
+		# - joint velocities for those joints
+		# - fall_speed (from torso angvel)
+		# - time_to_impact
+		# - fall_angle (estimated from torso quat + linvel_xy)
+		# - is_in_compliant_mode flag
+		self.obs_dim = 2 * len(self.control_joint_names) + 4
+		self.observation_space = spaces.Box(
+			low=-np.inf,
+			high=np.inf,
+			shape=(self.obs_dim,),
+			dtype=np.float32,
+		)
+
+	def _build_obs(self, info: Dict[str, Any]) -> np.ndarray:
+		qpos = self.core_env.data.qpos[self._joint_indices].astype(np.float64)
+		qvel = self.core_env.data.qvel[self._dof_indices].astype(np.float64)
+
+		# Normalize joint angles and velocities
+		qpos_norm = qpos / np.pi
+		qvel_norm = qvel / 10.0
+
+		# Fall speed from torso angular velocity
+		wx = float(info.get("torso_angvel_x", 0.0))
+		wy = float(info.get("torso_angvel_y", 0.0))
+		fall_speed = float(np.sqrt(wx**2 + wy**2))
+		fall_speed_norm = fall_speed / max(self.reward_cfg.max_fall_speed, 1e-6)
+
+		# Time to impact
+		t_impact = float(info.get("time_to_impact", float("inf")))
+		if np.isinf(t_impact):
+			tti_norm = 1.0
+		else:
+			tti_norm = np.clip(t_impact / max(self.reward_cfg.max_head_vel, 1e-6), 0.0, 1.0)
+
+		# Fall angle (reuse same estimator as in run_experiments)
+		qw = float(info.get("torso_quat_w", 1.0))
+		qx = float(info.get("torso_quat_x", 0.0))
+		qy = float(info.get("torso_quat_y", 0.0))
+		qz = float(info.get("torso_quat_z", 0.0))
+		q = np.array([qw, qx, qy, qz], dtype=np.float64)
+		q_norm = float(np.linalg.norm(q))
+		if q_norm > 1e-9:
+			q = q / q_norm
+
+		vx = float(info.get("torso_linvel_x", 0.0))
+		vy = float(info.get("torso_linvel_y", 0.0))
+		v_inst = _estimate_fall_direction_vector(q, np.array([vx, vy], dtype=np.float64), alpha_tilt=0.85)
+		if float(np.linalg.norm(v_inst)) > 1e-6:
+			fall_angle = float(np.arctan2(v_inst[1], v_inst[0]))
+		else:
+			fall_angle = 0.0
+
+		fall_angle_norm = fall_angle / np.pi
+
+		compliant_flag = 1.0 if getattr(self.core_env, "is_in_compliant_mode", False) else 0.0
+
+		return np.concatenate(
+			[
+				qpos_norm,
+				qvel_norm,
+				np.array([fall_speed_norm, tti_norm, fall_angle_norm, compliant_flag], dtype=np.float64),
+			]
+		).astype(np.float32)
+
+	def _compute_reward(self, info: Dict[str, Any]) -> float:
+		# Approximate head vertical velocity as impact velocity proxy
+		head_body_id = self.core_env.head_body_id
+		head_vel_z = float(self.core_env.data.cvel[head_body_id, 2])
+		head_impact_vel = max(0.0, -head_vel_z)
+
+		total_load = float(info.get("total_load", 0.0))
+
+		wx = float(info.get("torso_angvel_x", 0.0))
+		wy = float(info.get("torso_angvel_y", 0.0))
+		fall_speed = float(np.sqrt(wx**2 + wy**2))
+
+		# Normalize for reward scaling
+		head_term = head_impact_vel / max(self.reward_cfg.max_head_vel, 1e-6)
+		torque_term = total_load / max(self.reward_cfg.max_torque, 1e-6)
+		speed_term = fall_speed / max(self.reward_cfg.max_fall_speed, 1e-6)
+
+		reward = -(
+			self.reward_cfg.w_head * head_term
+			+ self.reward_cfg.w_torque * torque_term
+			+ self.reward_cfg.w_speed * speed_term
+		)
+		return float(reward)
+
+	def reset(self, *, seed: int | None = None, options: Dict[str, Any] | None = None):
+		del options
+		if seed is not None:
+			super().reset(seed=seed)
+		core_obs, core_info = self.core_env.reset(seed=seed)
+		self.core_env.apply_gain_scales(
+			self.gain_cfg.kp_scale_stiff,
+			self.gain_cfg.kd_scale_stiff,
+			self.gain_cfg,
+		)
+		self._switched_to_compliance = False
+		self._push_steps = int(np.ceil(self.push_cfg.duration_sec / self.core_env.model.opt.timestep))
+		del core_obs
+		self._episode_step = 0
+		obs = self._build_obs(core_info)
+		return obs, {}
+
+	def step(self, action: np.ndarray):
+		if action.shape != self.action_space.shape:
+			raise ValueError(f"Action shape mismatch: got {action.shape}, expected {self.action_space.shape}")
+
+		action = np.asarray(action, dtype=np.float64)
+		delta = np.clip(action, -1.0, 1.0) * self.max_joint_delta
+
+		# Apply forward push at head for the initial phase of the episode.
+		self.core_env.data.xfrc_applied[:, :] = 0.0
+		if self._episode_step < self._push_steps:
+			self.core_env.data.xfrc_applied[self.core_env.head_body_id, :3] = np.array(self.push_cfg.force_xyz)
+
+		current_q = self.core_env.data.qpos[self._joint_indices].copy()
+		target_q = current_q + delta
+		self.core_env._target_ctrl = target_q
+		self.core_env.data.ctrl[self.core_env.control_actuator_ids] = target_q
+
+		core_obs, _, _, _, info = self.core_env.step(np.zeros_like(self.core_env.action_space.low, dtype=np.float64))
+		del core_obs
+
+		# Time-to-impact based compliance trigger
+		t_impact = float(info.get("time_to_impact", float("inf")))
+		if (not self._switched_to_compliance) and (t_impact <= self.tti_cfg.threshold):
+			self.core_env.apply_gain_scales(
+				self.gain_cfg.kp_scale_compliant,
+				self.gain_cfg.kd_scale_compliant,
+				self.gain_cfg,
+			)
+			self._switched_to_compliance = True
+
+		self._episode_step += 1
+		obs = self._build_obs(info)
+		reward = self._compute_reward(info)
+
+		terminated = False
+		truncated = self._episode_step >= self.max_episode_steps
+
+		return obs, reward, terminated, truncated, info
+
+	def render(self):
+		return self.core_env.render()
+
+	def close(self):
+		self.core_env.close()
+
+
+class EpisodeCounterCallback(BaseCallback):
+	def __init__(
+		self,
+		checkpoint_dir: Path,
+		video_dir: Path,
+		env_fn: Callable[[], gym.Env],
+		n_envs: int,
+		checkpoint_interval_episodes: int,
+		video_interval_episodes: int,
+		verbose: int = 0,
+	) -> None:
+		super().__init__(verbose=verbose)
+		self.checkpoint_dir = checkpoint_dir
+		self.video_dir = video_dir
+		self.env_fn = env_fn
+		self.n_envs = n_envs
+		self.checkpoint_interval_episodes = max(1, checkpoint_interval_episodes)
+		self.video_interval_episodes = max(1, video_interval_episodes)
+		self.episode_count = 0
+		self.episode_rewards: List[float] = []
+		self.episode_peak_loads: List[float] = []
+		self._episode_rewards = np.zeros(self.n_envs, dtype=np.float64)
+		self._episode_peak_loads = np.zeros(self.n_envs, dtype=np.float64)
+
+	def _on_step(self) -> bool:
+		if self.locals is None:
+			return True
+		dones = self.locals.get("dones")
+		rewards = self.locals.get("rewards")
+		infos = self.locals.get("infos")
+		if dones is None or rewards is None:
+			return True
+
+		rewards_arr = np.asarray(rewards, dtype=np.float64)
+		for i in range(self.n_envs):
+			self._episode_rewards[i] += float(rewards_arr[i])
+			if infos is not None and i < len(infos):
+				info_i = infos[i] or {}
+				load_i = float(info_i.get("total_load", 0.0))
+				if load_i > self._episode_peak_loads[i]:
+					self._episode_peak_loads[i] = load_i
+
+		dones_arr = np.asarray(dones, dtype=bool)
+		if np.any(dones_arr):
+			for i, done in enumerate(dones_arr):
+				if not done:
+					continue
+				self.episode_count += 1
+				self.episode_rewards.append(float(self._episode_rewards[i]))
+				self.episode_peak_loads.append(float(self._episode_peak_loads[i]))
+				self._episode_rewards[i] = 0.0
+				self._episode_peak_loads[i] = 0.0
+
+				if self.episode_count % self.checkpoint_interval_episodes == 0:
+					if self.model is not None:
+						filename = self.checkpoint_dir / f"ppo_ep_{self.episode_count:06d}"
+						self.model.save(str(filename))
+
+				if self.episode_count % self.video_interval_episodes == 0 and VecVideoRecorder is not None:
+					self._record_video()
+
+		return True
+
+	def _record_video(self) -> None:
+		if self.model is None:
+			return
+		if DummyVecEnv is None:
+			return
+
+		eval_env = DummyVecEnv([self.env_fn])
+		# VecVideoRecorder expects env.render_mode == "rgb_array".
+		setattr(eval_env, "render_mode", "rgb_array")
+		video_length = 250
+
+		if VecVideoRecorder is not None:
+			eval_env = VecVideoRecorder(
+				eval_env,
+				video_folder=str(self.video_dir),
+				record_video_trigger=lambda _: True,
+				video_length=video_length,
+				name_prefix=f"ep_{self.episode_count:06d}",
+			)
+
+		obs = eval_env.reset()
+		for _ in range(video_length):
+			action, _ = self.model.predict(obs, deterministic=True)
+			obs, _, dones, _ = eval_env.step(action)
+			if np.any(dones):
+				break
+		eval_env.close()
+
+
+def train_ppo_forward_fall_arms(
+	training_cfg: RLTrainingConfig | None = None,
+	reward_cfg: RewardConfig | None = None,
+) -> None:
+	if PPO is None or DummyVecEnv is None or Monitor is None:
+		raise RuntimeError(
+			"Stable-Baselines3 and its wrappers are required for training but could not be imported."
+		)
+
+	training_cfg = training_cfg or RLTrainingConfig()
+	reward_cfg = reward_cfg or RewardConfig()
+
+	root = Path(__file__).resolve().parent
+	scene_xml = root / "robotis_op3" / "scene.xml"
+
+	run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+	run_dir = root / "runs" / run_ts
+	checkpoint_dir = run_dir / "checkpoints"
+	video_dir = run_dir / "videos"
+	log_dir = run_dir / "logs"
+
+	checkpoint_dir.mkdir(parents=True, exist_ok=True)
+	video_dir.mkdir(parents=True, exist_ok=True)
+	log_dir.mkdir(parents=True, exist_ok=True)
+
+	def make_env(rank: int) -> Callable[[], gym.Env]:
+		def _init() -> gym.Env:
+			env = Op3FallControlArmsRL(
+				model_xml=scene_xml,
+				goal_angles=GOAL_ANGLES,
+				reward_cfg=reward_cfg,
+				max_episode_steps=training_cfg.max_episode_steps,
+				seed=rank,
+			)
+			return Monitor(env)
+
+		return _init
+
+	if training_cfg.n_envs > 1 and SubprocVecEnv is not None:
+		env_fns: List[Callable[[], gym.Env]] = [make_env(i) for i in range(training_cfg.n_envs)]
+		vec_env = SubprocVecEnv(env_fns)
+	else:
+		vec_env = DummyVecEnv([make_env(0)])
+
+	actual_n_envs = getattr(vec_env, "num_envs", training_cfg.n_envs)
+
+	model = PPO(
+		"MlpPolicy",
+		vec_env,
+		n_steps=training_cfg.n_steps,
+		batch_size=training_cfg.batch_size,
+		learning_rate=training_cfg.learning_rate,
+		gamma=training_cfg.gamma,
+		gae_lambda=training_cfg.gae_lambda,
+		verbose=1,
+		tensorboard_log=str(log_dir),
+	)
+
+	callback = EpisodeCounterCallback(
+		checkpoint_dir=checkpoint_dir,
+		video_dir=video_dir,
+		env_fn=make_env(0),
+		n_envs=actual_n_envs,
+		checkpoint_interval_episodes=training_cfg.checkpoint_interval_episodes,
+		video_interval_episodes=training_cfg.video_interval_episodes,
+	)
+
+	model.learn(total_timesteps=training_cfg.total_timesteps, callback=callback)
+	vec_env.close()
+
+	# Plot training statistics.
+	if callback.episode_rewards:
+		episodes = np.arange(1, len(callback.episode_rewards) + 1)
+		plt.figure(figsize=(8, 4))
+		plt.plot(episodes, callback.episode_rewards)
+		plt.xlabel("Episode")
+		plt.ylabel("Total Reward")
+		plt.title("Training Reward per Episode")
+		plt.grid(True, alpha=0.3)
+		plt.tight_layout()
+		plt.savefig(run_dir / "reward_per_episode.png", dpi=150)
+		plt.close()
+
+	if callback.episode_peak_loads:
+		episodes = np.arange(1, len(callback.episode_peak_loads) + 1)
+		plt.figure(figsize=(8, 4))
+		plt.plot(episodes, callback.episode_peak_loads)
+		plt.xlabel("Episode")
+		plt.ylabel("Peak Total Load")
+		plt.title("Peak Load per Episode")
+		plt.grid(True, alpha=0.3)
+		plt.tight_layout()
+		plt.savefig(run_dir / "peak_load_per_episode.png", dpi=150)
+		plt.close()
+
+
 if __name__ == "__main__":
-	run_experiments()
+	train_ppo_forward_fall_arms()
