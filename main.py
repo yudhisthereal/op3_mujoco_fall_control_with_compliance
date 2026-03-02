@@ -24,10 +24,10 @@ GOAL_ANGLES: dict[str, float] = {
 	"l_sho_roll": 0.9,
 	"r_el": 0.8,
 	"l_el": -0.8,
-	"r_hip_pitch": 0.57,
-	"l_hip_pitch": -0.57,
-	"r_knee": -1.5,
-	"l_knee": 1.5,
+	"r_hip_pitch": 0.3,
+	"l_hip_pitch": -0.3,
+	"r_knee": -0.6,
+	"l_knee": 0.6,
 }
 
 
@@ -299,10 +299,9 @@ class Op3FallControlEnv(gym.Env):
 		info = {
 			"qfrc_actuator_l1": float(np.sum(np.abs(self.data.qfrc_actuator[self.control_dof_ids]))),
 			"qfrc_constraint_l1": float(np.sum(np.abs(self.data.qfrc_constraint))),
-			"actuator_force_l1": float(np.sum(np.abs(self.data.actuator_force[self.control_actuator_ids]))),
 		}
 		info["total_load"] = (
-			info["qfrc_actuator_l1"] + info["qfrc_constraint_l1"] + info["actuator_force_l1"]
+			info["qfrc_actuator_l1"] + info["qfrc_constraint_l1"]
 		)
 		
 		# Add IMU readings with detailed component information
@@ -419,8 +418,6 @@ def run_experiments() -> None:
 	compliant_m1: list[np.ndarray] = []
 	stiff_m2: list[np.ndarray] = []
 	compliant_m2: list[np.ndarray] = []
-	stiff_m3: list[np.ndarray] = []
-	compliant_m3: list[np.ndarray] = []
 	
 	# NEW: Store final limb Z-positions for each run
 	# Updated with correct limb names from the XML
@@ -486,7 +483,6 @@ def run_experiments() -> None:
 
 			m1_list: list[float] = []
 			m2_list: list[float] = []
-			m3_list: list[float] = []
 			total_list: list[float] = []
 			spike_flags: list[bool] = []
 			
@@ -524,18 +520,22 @@ def run_experiments() -> None:
 
 				m1 = info["qfrc_actuator_l1"]
 				m2 = info["qfrc_constraint_l1"]
-				m3 = info["actuator_force_l1"]
 				total = info["total_load"]
 
 				m1_list.append(m1)
 				m2_list.append(m2)
-				m3_list.append(m3)
 				total_list.append(total)
 
 				# Keep original fall-speed definition from angular velocity.
 				wx = float(info.get("torso_angvel_x", 0.0))
 				wy = float(info.get("torso_angvel_y", 0.0))
 				fall_speed = float(np.sqrt(wx**2 + wy**2))
+
+				# Trigger compliance when fall_speed >= 3.5
+				if compliant_run and (not switched_to_compliance) and fall_speed >= 3.5:
+					env.apply_gain_scales(gain_cfg.kp_scale_compliant, gain_cfg.kd_scale_compliant, gain_cfg)
+					switched_to_compliance = True
+					compliance_step = step
 
 				# Moderate goal gate.
 				err = env.get_goal_errors()
@@ -549,11 +549,6 @@ def run_experiments() -> None:
 				if goal_reached_step is None and goal_count >= gate_cfg.consecutive_steps:
 					goal_reached_step = step
 
-				if compliant_run and (not switched_to_compliance) and (goal_reached_step is not None):
-					env.apply_gain_scales(gain_cfg.kp_scale_compliant, gain_cfg.kd_scale_compliant, gain_cfg)
-					switched_to_compliance = True
-					compliance_step = step
-
 				# Impact spike detection on total load.
 				is_spike = False
 				if len(rolling) >= impact_cfg.rolling_window:
@@ -564,11 +559,6 @@ def run_experiments() -> None:
 						is_spike = True
 						refractory = impact_cfg.refractory_steps
 						last_spike_step = step
-						# If we get a spike before switching to compliance, we can trigger early compliance.
-						if compliant_run and not switched_to_compliance:
-							env.apply_gain_scales(gain_cfg.kp_scale_compliant, gain_cfg.kd_scale_compliant, gain_cfg)
-							switched_to_compliance = True
-							compliance_step = step
        
 				rolling.append(total)
 				spike_flags.append(is_spike)
@@ -649,7 +639,6 @@ def run_experiments() -> None:
 			fig, ax = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
 			ax[0].plot(t, m1_list, label="qfrc_actuator (L1)")
 			ax[1].plot(t, m2_list, label="qfrc_constraint (L1)", color="tab:orange")
-			ax[2].plot(t, m3_list, label="actuator_force (L1)", color="tab:green")
 			ax[3].plot(t, total_list, label="total_load", color="tab:red")
 
 			for i in range(4):
@@ -693,17 +682,14 @@ def run_experiments() -> None:
 
 			m1_arr = np.array(m1_list)
 			m2_arr = np.array(m2_list)
-			m3_arr = np.array(m3_list)
 			total_arr = np.array(total_list)
 			if compliant_run:
 				compliant_m1.append(m1_arr)
 				compliant_m2.append(m2_arr)
-				compliant_m3.append(m3_arr)
 				compliant_total.append(total_arr)
 			else:
 				stiff_m1.append(m1_arr)
 				stiff_m2.append(m2_arr)
-				stiff_m3.append(m3_arr)
 				stiff_total.append(total_arr)
 
 		# Envelope plots (stiff vs compliant) for all requested metrics + total.
@@ -711,7 +697,6 @@ def run_experiments() -> None:
 			metric_pairs = [
 				("qfrc_actuator", stiff_m1, compliant_m1),
 				("qfrc_constraint", stiff_m2, compliant_m2),
-				("actuator_force", stiff_m3, compliant_m3),
 				("total_load", stiff_total, compliant_total),
 			]
 
