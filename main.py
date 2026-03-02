@@ -391,8 +391,8 @@ def run_experiments() -> None:
 	imu_out_dir.mkdir(parents=True, exist_ok=True)
 	out_dir.mkdir(parents=True, exist_ok=True)
 
-	num_runs = 1
-	max_steps = 50
+	num_runs = 4
+	max_steps = 500
 	base_seed = 1234
 
 	gain_cfg = GainConfig()
@@ -474,7 +474,7 @@ def run_experiments() -> None:
 
 	try:
 		for run_idx in range(num_runs):
-			compliant_run = True
+			compliant_run = run_idx >= num_runs // 2
 			env.reset(seed=base_seed + run_idx)
 			env.set_goal_angles(GOAL_ANGLES)
 			env.apply_gain_scales(gain_cfg.kp_scale_stiff, gain_cfg.kd_scale_stiff, gain_cfg)
@@ -636,13 +636,20 @@ def run_experiments() -> None:
 
 			# Per-run plots.
 			t = np.arange(max_steps)
-			fig, ax = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+			fig, ax = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
 			ax[0].plot(t, m1_list, label="qfrc_actuator (L1)")
 			ax[1].plot(t, m2_list, label="qfrc_constraint (L1)", color="tab:orange")
-			ax[3].plot(t, total_list, label="total_load", color="tab:red")
+			ax[2].plot(t, total_list, label="total_load", color="tab:red")
 
-			for i in range(4):
+			for i in range(3):
 				ax[i].grid(True, alpha=0.3)
+				# Add vertical lines for impact spikes
+				impact_labeled = False
+				for step, is_spike in enumerate(spike_flags):
+					if is_spike:
+						label = "impact" if not impact_labeled else None
+						ax[i].axvline(step, color="red", linestyle="-", alpha=0.3, linewidth=1, label=label)
+						impact_labeled = True
 				if goal_reached_step is not None:
 					ax[i].axvline(goal_reached_step, color="k", linestyle="--", alpha=0.4, label="goal reached")
 				if compliance_step is not None:
@@ -700,7 +707,7 @@ def run_experiments() -> None:
 				("total_load", stiff_total, compliant_total),
 			]
 
-			fig, axs = plt.subplots(4, 2, figsize=(14, 16), sharex=True)
+			fig, axs = plt.subplots(3, 2, figsize=(14, 12), sharex=True)
 			x = np.arange(max_steps)
 			for row, (name, stiff_curves, comp_curves) in enumerate(metric_pairs):
 				stiff_env = compute_envelope(stiff_curves)
