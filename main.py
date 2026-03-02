@@ -36,7 +36,7 @@ class GainConfig:
 	kp_scale_stiff: float = 1.0
 	kd_scale_stiff: float = 1.0
 	kp_scale_compliant: float = 0.45
-	kd_scale_compliant: float = 1.8
+	kd_scale_compliant: float = 1.9
 	kp_scale_min: float = 0.2
 	kp_scale_max: float = 1.5
 	kd_scale_min: float = 0.5
@@ -71,6 +71,12 @@ class RestoreConfig:
 class PushConfig:
 	force_xyz: tuple[float, float, float] = (25.0, 0.0, 0.0)
 	duration_sec: float = 0.08
+
+
+@dataclass
+class TimeToImpactConfig:
+	threshold: float = 0.15  # Time to impact threshold in seconds (reduced for earlier detection)
+	eps: float = 1e-6  # Epsilon for avoiding division by zero
 
 
 class Op3FallControlEnv(gym.Env):
@@ -138,6 +144,10 @@ class Op3FallControlEnv(gym.Env):
 		self.imu_data_ranges = self._get_imu_data_ranges()
 		print(f"Found {len(self.imu_sensor_ids)} IMU sensors: {list(self.imu_sensor_ids.keys())}")
 
+		# NEW: Initialize body IDs for time-to-impact calculation
+		self.body_ids_for_impact = self._get_body_ids_for_impact()
+		print(f"Found {len(self.body_ids_for_impact)} bodies for impact detection: {list(self.body_ids_for_impact.keys())}")
+
 		# Minimal observation/action spaces for gym compatibility.
 		self.observation_space = spaces.Box(
 			low=-np.inf,
@@ -160,6 +170,71 @@ class Op3FallControlEnv(gym.Env):
 			if body_id >= 0:
 				return body_id
 		raise ValueError("Could not resolve head body for push force.")
+
+	def _get_body_ids_for_impact(self) -> dict[str, int]:
+		"""Get body IDs for all body parts needed for time-to-impact calculation."""
+		body_names = {
+			# Hands (if sites exist, otherwise use elbow links)
+			"left_hand": "l_el_link",
+			"right_hand": "r_el_link",
+			# Elbows
+			"left_elbow": "l_el_link",
+			"right_elbow": "r_el_link",
+			# Knees
+			"left_knee": "l_knee_link",
+			"right_knee": "r_knee_link",
+			# Torso (COM)
+			"torso": "body_link",
+			# Head
+			"head": "head_tilt_link",
+			# Feet
+			"left_foot": "l_ank_roll_link",
+			"right_foot": "r_ank_roll_link",
+		}
+		
+		body_ids = {}
+		for friendly_name, xml_name in body_names.items():
+			body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, xml_name)
+			if body_id >= 0:
+				body_ids[friendly_name] = body_id
+			else:
+				print(f"Warning: Could not find body {xml_name} for {friendly_name}")
+		
+		return body_ids
+
+	def compute_time_to_impact(self) -> tuple[float, str | None]:
+		"""
+		Compute minimum time to impact across all tracked body parts.
+		
+		Returns:
+			tuple[float, str | None]: (minimum time to impact, name of body part with min time)
+		"""
+		min_t_impact = float('inf')
+		min_body_name = None
+		
+		for body_name, body_id in self.body_ids_for_impact.items():
+			if body_id >= 0:
+				# Get z-position (height above ground)
+				z_pos = float(self.data.xpos[body_id, 2])
+				
+				# Get vertical velocity from cvel (composite velocity)
+				# cvel contains [linear_vel_x, linear_vel_y, linear_vel_z, angular_vel_x, angular_vel_y, angular_vel_z]
+				z_vel = float(self.data.cvel[body_id, 2])  # Linear Z velocity
+				
+				# Only consider if falling downward (z_vel < 0)
+				if z_vel < -1e-6:  # Small threshold to avoid near-zero velocities
+					# Time to impact = height / downward speed
+					t_impact = z_pos / abs(z_vel)
+					
+					if t_impact < min_t_impact:
+						min_t_impact = t_impact
+						min_body_name = body_name
+		
+		# If no body parts are falling, return infinity
+		if min_t_impact == float('inf'):
+			return float('inf'), None
+		
+		return min_t_impact, min_body_name
 
 	def _find_imu_sensors(self) -> dict[str, int]:
 		"""Find all IMU-related sensors in the model."""
@@ -307,6 +382,11 @@ class Op3FallControlEnv(gym.Env):
 		# Add IMU readings with detailed component information
 		imu_readings = self._read_imu_data()
 		info.update(imu_readings)
+		
+		# NEW: Add time-to-impact information
+		t_impact, critical_body = self.compute_time_to_impact()
+		info["time_to_impact"] = t_impact
+		info["critical_body"] = critical_body if critical_body else "none"
 
 		terminated = False
 		truncated = False
@@ -400,6 +480,7 @@ def run_experiments() -> None:
 	gate_cfg = GoalGateConfig()
 	restore_cfg = RestoreConfig()
 	push_cfg = PushConfig()
+	tti_cfg = TimeToImpactConfig()  # Time-to-impact config
 
 	env = Op3FallControlEnv(
 		model_xml=scene_xml,
@@ -419,58 +500,18 @@ def run_experiments() -> None:
 	stiff_m2: list[np.ndarray] = []
 	compliant_m2: list[np.ndarray] = []
 	
-	# NEW: Store final limb Z-positions for each run
-	# Updated with correct limb names from the XML
-	final_limb_positions: dict[str, list[float]] = {
-		# Arms (shoulder/upper arm links)
-		"left_shoulder": [],      # l_sho_pitch_link
-		"right_shoulder": [],     # r_sho_pitch_link
-		"left_upper_arm": [],     # l_sho_roll_link
-		"right_upper_arm": [],    # r_sho_roll_link
-		# Elbows (forearm links)
-		"left_elbow": [],         # l_el_link
-		"right_elbow": [],        # r_el_link
-		# Knees
-		"left_knee": [],          # l_knee_link
-		"right_knee": [],         # r_knee_link
-		# Feet (ankle/foot links)
-		"left_foot": [],          # l_ank_roll_link (last link in left leg chain)
-		"right_foot": [],         # r_ank_roll_link (last link in right leg chain)
-		# Additional useful tracking points
-		"head": [],               # head_tilt_link
-		"torso": [],              # body_link
-		"left_hand": [],          # l_el_link (end of arm chain)
-		"right_hand": []          # r_el_link (end of arm chain)
-	}
-
-	# NEW: Get body IDs for key limbs
-	# Map friendly names to actual body names in the XML
-	body_name_mapping = {
-		"left_shoulder": "l_sho_pitch_link",
-		"right_shoulder": "r_sho_pitch_link",
-		"left_upper_arm": "l_sho_roll_link",
-		"right_upper_arm": "r_sho_roll_link",
-		"left_elbow": "l_el_link",
-		"right_elbow": "r_el_link",
-		"left_knee": "l_knee_link",
-		"right_knee": "r_knee_link",
-		"left_foot": "l_ank_roll_link",
-		"right_foot": "r_ank_roll_link",
-		"head": "head_tilt_link",
-		"torso": "body_link",
-		"left_hand": "l_el_link",      # Same as elbow, but tracked separately
-		"right_hand": "r_el_link"      # Same as elbow, but tracked separately
-	}
+	# Store time-to-impact data
+	tti_history: dict[int, list[float]] = {}  # run_idx -> list of tti values
+	critical_body_history: dict[int, list[str]] = {}  # run_idx -> list of critical bodies
 	
-	# Resolve all body IDs
-	body_ids = {}
-	for friendly_name, xml_name in body_name_mapping.items():
-		body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, xml_name)
-		if body_id >= 0:
-			body_ids[friendly_name] = body_id
-			print(f"Found body: {friendly_name} ({xml_name}) with ID: {body_id}")
-		else:
-			print(f"Warning: Could not find body {xml_name} for {friendly_name}")
+	# Store final limb Z-positions for each run
+	final_limb_positions: dict[str, list[float]] = {
+		"left_hand": [], "right_hand": [],
+		"left_elbow": [], "right_elbow": [],
+		"left_knee": [], "right_knee": [],
+		"torso": [], "head": [],
+		"left_foot": [], "right_foot": []
+	}
 
 	try:
 		for run_idx in range(num_runs):
@@ -485,6 +526,10 @@ def run_experiments() -> None:
 			m2_list: list[float] = []
 			total_list: list[float] = []
 			spike_flags: list[bool] = []
+			
+			# NEW: Store time-to-impact data for this run
+			tti_list: list[float] = []
+			critical_body_list: list[str] = []
 			
 			# Fall dynamics tracking
 			fall_speed_list: list[float] = []
@@ -506,7 +551,7 @@ def run_experiments() -> None:
 			restore_started = False
 			restore_step = 0
 			restore_start_step: int | None = None
-
+			impact_detected = False
 
 			for step in range(max_steps):
 				# Initial push at head.
@@ -521,21 +566,27 @@ def run_experiments() -> None:
 				m1 = info["qfrc_actuator_l1"]
 				m2 = info["qfrc_constraint_l1"]
 				total = info["total_load"]
+				t_impact = info["time_to_impact"]
+				critical_body = info["critical_body"]
 
 				m1_list.append(m1)
 				m2_list.append(m2)
 				total_list.append(total)
+				tti_list.append(t_impact)
+				critical_body_list.append(critical_body)
 
 				# Keep original fall-speed definition from angular velocity.
 				wx = float(info.get("torso_angvel_x", 0.0))
 				wy = float(info.get("torso_angvel_y", 0.0))
 				fall_speed = float(np.sqrt(wx**2 + wy**2))
 
-				# Trigger compliance when fall_speed >= 3.5
-				if compliant_run and (not switched_to_compliance) and fall_speed >= 3.5:
+				# NEW: Trigger compliance based on time-to-impact
+				if compliant_run and (not switched_to_compliance) and t_impact <= tti_cfg.threshold:
 					env.apply_gain_scales(gain_cfg.kp_scale_compliant, gain_cfg.kd_scale_compliant, gain_cfg)
 					switched_to_compliance = True
+					impact_detected = True
 					compliance_step = step
+					print(f"Run {run_idx} - Time-to-impact triggered at step {step}: t_impact={t_impact:.3f}s <= {tti_cfg.threshold}s (critical body: {critical_body})")
 
 				# Moderate goal gate.
 				err = env.get_goal_errors()
@@ -549,7 +600,7 @@ def run_experiments() -> None:
 				if goal_reached_step is None and goal_count >= gate_cfg.consecutive_steps:
 					goal_reached_step = step
 
-				# Impact spike detection on total load.
+				# Impact spike detection on total load (backup method)
 				is_spike = False
 				if len(rolling) >= impact_cfg.rolling_window:
 					mu = float(np.mean(rolling))
@@ -559,6 +610,13 @@ def run_experiments() -> None:
 						is_spike = True
 						refractory = impact_cfg.refractory_steps
 						last_spike_step = step
+						# Spike-based compliance trigger (backup)
+						if compliant_run and not switched_to_compliance:
+							env.apply_gain_scales(gain_cfg.kp_scale_compliant, gain_cfg.kd_scale_compliant, gain_cfg)
+							switched_to_compliance = True
+							compliance_step = step
+							impact_detected = True
+							print(f"Run {run_idx} - Force spike triggered at step {step}")
        
 				rolling.append(total)
 				spike_flags.append(is_spike)
@@ -598,7 +656,8 @@ def run_experiments() -> None:
 				fall_speed_list.append(fall_speed)
 				fall_angle_list.append(fall_angle)
 
-				if switched_to_compliance and not restore_started:
+				# Restoration condition after loads subside (for compliant runs only)
+				if switched_to_compliance and impact_detected and not restore_started:
 					baseline = float(np.mean(total_list[: impact_cfg.rolling_window])) if len(total_list) >= impact_cfg.rolling_window else float(np.mean(total_list))
 					no_recent_spike = (
 						last_spike_step is None or (step - last_spike_step) >= restore_cfg.no_spike_steps
@@ -622,20 +681,53 @@ def run_experiments() -> None:
 
 				last_total = total
 
-			# NEW: Record final limb positions (Z-axis only) at the end of the run
-			if body_ids:
-				for limb_name, body_id in body_ids.items():
-					if body_id >= 0:
-						# Get the body's position in world coordinates
-						z_position = float(env.data.xpos[body_id, 2])  # Z-axis is index 2
-						final_limb_positions[limb_name].append(z_position)
-						print(f"Run {run_idx} - {limb_name} final Z-position: {z_position:.4f}")
-					else:
-						final_limb_positions[limb_name].append(float('nan'))
-						print(f"Run {run_idx} - {limb_name} not found, logging NaN")
+			# Store time-to-impact history
+			tti_history[run_idx] = tti_list
+			critical_body_history[run_idx] = critical_body_list
 
-			# Per-run plots.
+			# Record final limb positions
+			for limb_name, body_id in env.body_ids_for_impact.items():
+				if body_id >= 0:
+					z_position = float(env.data.xpos[body_id, 2])
+					final_limb_positions[limb_name].append(z_position)
+					print(f"Run {run_idx} - {limb_name} final Z-position: {z_position:.4f}")
+				else:
+					final_limb_positions[limb_name].append(float('nan'))
+
+			# Plot time-to-impact data
 			t = np.arange(max_steps)
+			fig, ax = plt.subplots(2, 1, figsize=(12, 8))
+			
+			# Time-to-impact
+			ax[0].plot(t, tti_list, label="time_to_impact", color="green", linewidth=2)
+			ax[0].axhline(y=tti_cfg.threshold, color="red", linestyle="--", alpha=0.7, label=f"threshold ({tti_cfg.threshold}s)")
+			if compliance_step is not None:
+				ax[0].axvline(compliance_step, color="purple", linestyle=":", alpha=0.6, label="compliance ON")
+			ax[0].set_ylabel("Time to Impact (s)")
+			ax[0].set_title(f"Run {run_idx}: Time-to-Impact")
+			ax[0].grid(True, alpha=0.3)
+			ax[0].legend(loc="upper right")
+			ax[0].set_ylim(bottom=0)
+			
+			# Critical body (as categorical)
+			# Convert to numeric for plotting
+			unique_bodies = list(set(critical_body_list))
+			body_to_num = {body: i for i, body in enumerate(unique_bodies)}
+			critical_numeric = [body_to_num.get(b, -1) for b in critical_body_list]
+			
+			ax[1].scatter(t, critical_numeric, s=10, alpha=0.5)
+			ax[1].set_yticks(range(len(unique_bodies)))
+			ax[1].set_yticklabels(unique_bodies)
+			ax[1].set_ylabel("Critical Body")
+			ax[1].set_xlabel("Timestep")
+			ax[1].set_title("Critical Body (closest to impact)")
+			ax[1].grid(True, alpha=0.3)
+			
+			fig.tight_layout()
+			fig.savefig(imu_out_dir / f"run_{run_idx:02d}_time_to_impact.png", dpi=150)
+			plt.close(fig)
+
+			# Original load plots
 			fig, ax = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
 			ax[0].plot(t, m1_list, label="qfrc_actuator (L1)")
 			ax[1].plot(t, m2_list, label="qfrc_constraint (L1)", color="tab:orange")
@@ -647,7 +739,7 @@ def run_experiments() -> None:
 				impact_labeled = False
 				for step, is_spike in enumerate(spike_flags):
 					if is_spike:
-						label = "impact" if not impact_labeled else None
+						label = "force spike" if not impact_labeled else None
 						ax[i].axvline(step, color="red", linestyle="-", alpha=0.3, linewidth=1, label=label)
 						impact_labeled = True
 				if goal_reached_step is not None:
@@ -659,30 +751,29 @@ def run_experiments() -> None:
 				ax[i].legend(loc="upper right")
 
 			ax[-1].set_xlabel("Timestep")
-			ax[0].set_title(f"Run {run_idx}: {'compliant-after-goal' if compliant_run else 'stiff'}")
+			ax[0].set_title(f"Run {run_idx}: {'compliant' if compliant_run else 'stiff'}")
 			fig.tight_layout()
 			fig.savefig(out_dir / f"run_{run_idx:02d}_loads.png", dpi=150)
 			plt.close(fig)
 
-			# Plot fall dynamics (fall speed and fall angle)
-			t = np.arange(max_steps)
+			# Fall dynamics plot
 			fig, axs = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-
-			# Fall speed
 			axs[0].plot(t, fall_speed_list, label="fall_speed", color="tab:red", linewidth=2)
-			axs[0].set_title(f"Run {run_idx}: Fall Speed = sqrt(wx² + wy²)")
 			axs[0].set_ylabel("Fall Speed (rad/s)")
 			axs[0].grid(True, alpha=0.3)
 			axs[0].legend(loc="upper right")
+			if compliance_step is not None:
+				axs[0].axvline(compliance_step, color="purple", linestyle=":", alpha=0.6)
 
-			# Fall angle
 			axs[1].plot(t, fall_angle_list, label="fall_angle", color="tab:blue", linewidth=2)
-			axs[1].set_title("Fall Angle (robust): filtered tilt/velocity, locked at impact")
 			axs[1].set_ylabel("Fall Angle (radians)")
 			axs[1].set_xlabel("Timestep")
 			axs[1].grid(True, alpha=0.3)
 			axs[1].legend(loc="upper right")
+			if compliance_step is not None:
+				axs[1].axvline(compliance_step, color="purple", linestyle=":", alpha=0.6)
 
+			fig.suptitle(f"Run {run_idx}: Fall Dynamics")
 			fig.tight_layout()
 			fig.savefig(imu_out_dir / f"run_{run_idx:02d}_fall_dynamics.png", dpi=150)
 			plt.close(fig)
@@ -699,71 +790,23 @@ def run_experiments() -> None:
 				stiff_m2.append(m2_arr)
 				stiff_total.append(total_arr)
 
-		# Envelope plots (stiff vs compliant) for all requested metrics + total.
-		if num_runs > 1 and stiff_total and compliant_total:
-			metric_pairs = [
-				("qfrc_actuator", stiff_m1, compliant_m1),
-				("qfrc_constraint", stiff_m2, compliant_m2),
-				("total_load", stiff_total, compliant_total),
-			]
-
-			fig, axs = plt.subplots(3, 2, figsize=(14, 12), sharex=True)
-			x = np.arange(max_steps)
-			for row, (name, stiff_curves, comp_curves) in enumerate(metric_pairs):
-				stiff_env = compute_envelope(stiff_curves)
-				comp_env = compute_envelope(comp_curves)
-
-				axs[row, 0].plot(x, stiff_env["median"], color="tab:blue", label="median")
-				axs[row, 0].fill_between(x, stiff_env["p10"], stiff_env["p90"], color="tab:blue", alpha=0.2, label="p10-p90")
-				axs[row, 0].set_title(f"Stiff: {name}")
-				axs[row, 0].grid(True, alpha=0.3)
-				axs[row, 0].legend(loc="upper right")
-
-				axs[row, 1].plot(x, comp_env["median"], color="tab:purple", label="median")
-				axs[row, 1].fill_between(x, comp_env["p10"], comp_env["p90"], color="tab:purple", alpha=0.2, label="p10-p90")
-				axs[row, 1].set_title(f"Compliant-after-goal: {name}")
-				axs[row, 1].grid(True, alpha=0.3)
-				axs[row, 1].legend(loc="upper right")
-
-				# Keep y-scale aligned per metric row for easier comparison.
-				y_min = min(float(np.min(stiff_env["p10"])), float(np.min(comp_env["p10"])))
-				y_max = max(float(np.max(stiff_env["p90"])), float(np.max(comp_env["p90"])))
-				axs[row, 0].set_ylim(y_min, y_max)
-				axs[row, 1].set_ylim(y_min, y_max)
-
-			axs[-1, 0].set_xlabel("Timestep")
-			axs[-1, 1].set_xlabel("Timestep")
-			fig.tight_layout()
-			fig.savefig(out_dir / "envelope_stiff_vs_compliant.png", dpi=150)
-			plt.close(fig)
-		else:
-			print("Skipping envelope plot: need at least 2 runs with both stiff and compliant cohorts.")
-
-		# Lightweight summary to terminal.
-		stiff_peaks = [float(np.max(c)) for c in stiff_total]
-		comp_peaks = [float(np.max(c)) for c in compliant_total]
-		stiff_auc = [float(np.trapezoid(c)) for c in stiff_total]
-		comp_auc = [float(np.trapezoid(c)) for c in compliant_total]
-
-		stiff_peak_median = float(np.median(stiff_peaks)) if stiff_peaks else None
-		comp_peak_median = float(np.median(comp_peaks)) if comp_peaks else None
-		stiff_auc_median = float(np.median(stiff_auc)) if stiff_auc else None
-		comp_auc_median = float(np.median(comp_auc)) if comp_auc else None
-
-		peak_summary = (
-			f"{stiff_peak_median:.6f} / {comp_peak_median:.6f}"
-			if (stiff_peak_median is not None and comp_peak_median is not None)
-			else "N/A (need both stiff and compliant runs)"
-		)
-		auc_summary = (
-			f"{stiff_auc_median:.6f} / {comp_auc_median:.6f}"
-			if (stiff_auc_median is not None and comp_auc_median is not None)
-			else "N/A (need both stiff and compliant runs)"
-		)
-
-		print("Saved plots to:", out_dir)
-		print("Median peak total_load (stiff/compliant):", peak_summary)
-		print("Median AUC total_load (stiff/compliant):", auc_summary)
+		# Summary statistics
+		print("\n" + "="*60)
+		print("EXPERIMENT SUMMARY")
+		print("="*60)
+		
+		# Time-to-impact statistics
+		print("\nTime-to-Impact Statistics:")
+		for run_idx, tti_vals in tti_history.items():
+			valid_tti = [t for t in tti_vals if t < float('inf')]
+			if valid_tti:
+				print(f"  Run {run_idx}: min={min(valid_tti):.3f}s, mean={np.mean(valid_tti):.3f}s, triggered={any(t <= tti_cfg.threshold for t in valid_tti)}")
+		
+		# Final limb positions
+		print("\nFinal Limb Z-Positions (averages):")
+		for limb_name, positions in final_limb_positions.items():
+			if positions and not all(np.isnan(p) for p in positions):
+				print(f"  {limb_name}: {np.nanmean(positions):.4f}m")
 
 	finally:
 		env.close()

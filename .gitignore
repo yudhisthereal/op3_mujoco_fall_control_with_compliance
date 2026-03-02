@@ -13,6 +13,7 @@ robotis_op3/
 
 # Run outputs
 outputs/
+archive/
 
 # Distribution / packaging
 .Python
