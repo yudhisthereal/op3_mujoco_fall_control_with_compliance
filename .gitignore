@@ -10,6 +10,7 @@ __pycache__/
 
 # 3rd party resources
 robotis_op3/
+!robotis_op3/op3.xml
 
 # Run outputs
 outputs/
