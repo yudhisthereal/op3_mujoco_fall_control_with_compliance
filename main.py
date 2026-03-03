@@ -31,7 +31,16 @@ except Exception:  # pragma: no cover
 	mj_viewer = None
 
 
-GOAL_ANGLES: dict[str, float] = {
+GOAL_ANGLES_ARMS: dict[str, float] = {
+	"r_sho_pitch": 1.57,
+	"l_sho_pitch": -1.57,
+	"r_sho_roll": -0.9,
+	"l_sho_roll": 0.9,
+	"r_el": 0.8,
+	"l_el": -0.8,
+}
+
+GOAL_ANGLES_ARMSLEGS: dict[str, float] = {
 	"r_sho_pitch": 1.57,
 	"l_sho_pitch": -1.57,
 	"r_sho_roll": -0.9,
@@ -89,7 +98,7 @@ class PushConfig:
 
 @dataclass
 class TimeToImpactConfig:
-	threshold: float = 0.15  # Time to impact threshold in seconds (reduced for earlier detection)
+	threshold: float = 0.1  # Time to impact threshold in seconds (increase for earlier detection)
 	eps: float = 1e-6  # Epsilon for avoiding division by zero
 
 
@@ -98,6 +107,7 @@ class RewardConfig:
 	w_head: float = 1.0
 	w_torque: float = 0.5
 	w_speed: float = 0.1
+	w_align: float = 0.3
 	max_head_vel: float = 5.0
 	max_torque: float = 500.0
 	max_fall_speed: float = 10.0
@@ -107,7 +117,7 @@ class RewardConfig:
 class RLTrainingConfig:
 	total_timesteps: int = 200_000
 	max_episode_steps: int = 250
-	n_envs: int = 8
+	n_envs: int = 1
 	checkpoint_interval_episodes: int = 100
 	video_interval_episodes: int = 100
 	n_steps: int = 2048
@@ -115,6 +125,11 @@ class RLTrainingConfig:
 	learning_rate: float = 3e-4
 	gamma: float = 0.99
 	gae_lambda: float = 0.95
+
+
+@dataclass
+class AlignConfig:
+	angle_threshold_rad: float = float(np.pi / 4.0)
 
 
 class Op3FallControlEnv(gym.Env):
@@ -479,6 +494,13 @@ def _normalize_2d(v: np.ndarray, eps: float = 1e-9) -> np.ndarray:
 	return v / n
 
 
+def _normalize_3d(v: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+	n = float(np.linalg.norm(v))
+	if n < eps:
+		return np.zeros(3, dtype=np.float64)
+	return v / n
+
+
 def _estimate_fall_direction_vector(
 	quat_wxyz: np.ndarray,
 	linvel_xy: np.ndarray,
@@ -506,6 +528,178 @@ def _estimate_fall_direction_vector(
 	return _normalize_2d(v)
 
 
+def _wrap_to_pi(angle: float) -> float:
+	return float((angle + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+def _direction_to_quat(direction: np.ndarray) -> np.ndarray:
+	"""Convert a 3D direction vector to a quaternion [w, x, y, z] that rotates
+	the +X axis (cylinder default after euler='0 90 0') to point in that direction.
+	"""
+	direction = _normalize_3d(direction)
+	if float(np.linalg.norm(direction)) < 1e-9:
+		return np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion
+	
+	# Default cylinder orientation after euler="0 90 0" is +X axis
+	default_axis = np.array([1.0, 0.0, 0.0])
+	
+	# Rotation axis: cross product
+	axis = np.cross(default_axis, direction)
+	axis_norm = float(np.linalg.norm(axis))
+	
+	# If parallel or anti-parallel
+	if axis_norm < 1e-9:
+		if float(np.dot(default_axis, direction)) > 0:
+			# Already aligned
+			return np.array([1.0, 0.0, 0.0, 0.0])
+		else:
+			# 180 degree rotation - use Y axis
+			return np.array([0.0, 0.0, 1.0, 0.0])
+	
+	axis = axis / axis_norm
+	angle = np.arccos(np.clip(np.dot(default_axis, direction), -1.0, 1.0))
+	
+	# Quaternion from axis-angle
+	half_angle = angle * 0.5
+	w = np.cos(half_angle)
+	xyz = axis * np.sin(half_angle)
+	
+	return np.array([w, xyz[0], xyz[1], xyz[2]])
+
+
+def _estimate_fall_direction_vector_3d(
+	quat_wxyz: np.ndarray,
+	linvel_xyz: np.ndarray,
+) -> np.ndarray:
+	del quat_wxyz
+	return _normalize_3d(linvel_xyz.astype(np.float64, copy=False))
+
+
+def _resolve_body_id(model: mujoco.MjModel, candidates: list[str]) -> int | None:
+	for name in candidates:
+		body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+		if body_id >= 0:
+			return body_id
+	return None
+
+
+def _resolve_site_id(model: mujoco.MjModel, candidates: list[str]) -> int | None:
+	for name in candidates:
+		site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name)
+		if site_id >= 0:
+			return site_id
+	return None
+
+
+def _try_get_torso_quat_and_linvel(info: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+	q = np.array(
+		[
+			float(info.get("torso_quat_w", 1.0)),
+			float(info.get("torso_quat_x", 0.0)),
+			float(info.get("torso_quat_y", 0.0)),
+			float(info.get("torso_quat_z", 0.0)),
+		],
+		dtype=np.float64,
+	)
+	qn = float(np.linalg.norm(q))
+	if qn > 1e-9:
+		q = q / qn
+
+	v = np.array(
+		[
+			float(info.get("torso_linvel_x", 0.0)),
+			float(info.get("torso_linvel_y", 0.0)),
+			float(info.get("torso_linvel_z", 0.0)),
+		],
+		dtype=np.float64,
+	)
+	return q, v
+
+
+def _get_arm_vector_and_critical(
+	env: Op3FallControlEnv,
+	side: str,
+	left_ids: dict[str, int | None],
+	right_ids: dict[str, int | None],
+) -> tuple[np.ndarray, str]:
+	ids = left_ids if side == "left" else right_ids
+	shoulder_id = ids.get("shoulder")
+	if shoulder_id is None:
+		return np.zeros(3, dtype=np.float64), "none"
+
+	candidates: list[tuple[str, np.ndarray]] = []
+	hand_site_id = ids.get("hand_site")
+	if hand_site_id is not None:
+		candidates.append(("hand", env.data.site_xpos[hand_site_id].astype(np.float64)))
+	hand_body_id = ids.get("hand_body")
+	if hand_body_id is not None:
+		candidates.append(("hand_body", env.data.xpos[hand_body_id].astype(np.float64)))
+	elbow_id = ids.get("elbow")
+	if elbow_id is not None:
+		candidates.append(("elbow", env.data.xpos[elbow_id].astype(np.float64)))
+
+	if not candidates:
+		return np.zeros(3, dtype=np.float64), "none"
+
+	critical_label, critical_pos = min(candidates, key=lambda item: float(item[1][2]))
+	shoulder_pos = env.data.xpos[shoulder_id].astype(np.float64)
+	arm_vec = _normalize_3d(critical_pos - shoulder_pos)
+	return arm_vec, critical_label
+
+
+def _alignment_score_from_angles(
+	arm_angle: float,
+	fall_angle: float,
+	threshold_rad: float,
+) -> tuple[float, float]:
+	diff = abs(_wrap_to_pi(arm_angle - fall_angle))
+	score = (1.0 - diff / max(threshold_rad, 1e-9)) if diff <= threshold_rad else 0.0
+	return float(np.clip(score, 0.0, 1.0)), float(diff)
+
+
+def _draw_vectors_programmatic(
+	env: Op3FallControlEnv,
+	fall_dir: np.ndarray,
+	left_arm_dir: np.ndarray,
+	right_arm_dir: np.ndarray,
+	arrow_ids: dict[str, int],
+	arrow_positions: dict[str, np.ndarray],
+	torso_angvel_x: float,
+	torso_angvel_y: float,
+) -> None:
+	"""Update arrow orientations while preserving fixed positions.
+	fall_speed is calculated from angular velocity: sqrt(wx^2 + wy^2)
+	"""
+	fall_speed = float(np.sqrt(torso_angvel_x**2 + torso_angvel_y**2))
+	
+	# Update fall direction arrow (red) - always update
+	if float(np.linalg.norm(fall_dir)) > 1e-9:
+		fall_quat = _direction_to_quat(fall_dir)
+		shaft_addr = arrow_ids["fall"]
+		env.data.qpos[shaft_addr:shaft_addr+3] = arrow_positions["fall"]
+		env.data.qpos[shaft_addr+3:shaft_addr+7] = fall_quat
+	else:
+		# Keep arrow position fixed
+		shaft_addr = arrow_ids["fall"]
+		env.data.qpos[shaft_addr:shaft_addr+3] = arrow_positions["fall"]
+	
+	# Update left arm arrow (green)
+	if float(np.linalg.norm(left_arm_dir)) > 1e-9:
+		left_quat = _direction_to_quat(left_arm_dir)
+		shaft_addr = arrow_ids["left"]
+		env.data.qpos[shaft_addr:shaft_addr+3] = arrow_positions["left"]
+		env.data.qpos[shaft_addr+3:shaft_addr+7] = left_quat
+	
+	# Update right arm arrow (blue)
+	if float(np.linalg.norm(right_arm_dir)) > 1e-9:
+		right_quat = _direction_to_quat(right_arm_dir)
+		shaft_addr = arrow_ids["right"]
+		env.data.qpos[shaft_addr:shaft_addr+3] = arrow_positions["right"]
+		env.data.qpos[shaft_addr+3:shaft_addr+7] = right_quat
+	
+	mujoco.mj_forward(env.model, env.data)
+
+
 def run_experiments() -> None:
 	root = Path(__file__).resolve().parent
 	scene_xml = root / "robotis_op3" / "scene.xml"
@@ -527,13 +721,26 @@ def run_experiments() -> None:
 
 	env = Op3FallControlEnv(
 		model_xml=scene_xml,
-		goal_angles=GOAL_ANGLES,
+		goal_angles=GOAL_ANGLES_ARMS,
 		render_mode="human",
 		control_timestep=0.02,
 		camera_distance=1.5,
 		camera_azimuth=160.0,
 		camera_elevation=-20.0,
 	)
+
+	left_ids = {
+		"shoulder": _resolve_body_id(env.model, ["l_sho_roll_link", "l_sho_pitch_link"]),
+		"elbow": _resolve_body_id(env.model, ["l_el_link"]),
+		"hand_site": _resolve_site_id(env.model, ["l_hand"]),
+		"hand_body": _resolve_body_id(env.model, ["l_hand_link", "l_grip_link"]),
+	}
+	right_ids = {
+		"shoulder": _resolve_body_id(env.model, ["r_sho_roll_link", "r_sho_pitch_link"]),
+		"elbow": _resolve_body_id(env.model, ["r_el_link"]),
+		"hand_site": _resolve_site_id(env.model, ["r_hand"]),
+		"hand_body": _resolve_body_id(env.model, ["r_hand_link", "r_grip_link"]),
+	}
 
 	# Logs by cohort.
 	stiff_total: list[np.ndarray] = []
@@ -556,11 +763,26 @@ def run_experiments() -> None:
 		"left_foot": [], "right_foot": []
 	}
 
+	# Get arrow shaft body IDs and qpos addresses for visualization
+	arrow_ids = {}
+	arrow_positions = {}
+	for name in ["fall", "left", "right"]:
+		shaft_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, f"arrow_{name}_shaft")
+		if shaft_body_id >= 0:
+			shaft_jnt_id = env.model.body_jntadr[shaft_body_id]
+			qpos_addr = env.model.jnt_qposadr[shaft_jnt_id]
+			arrow_ids[name] = qpos_addr
+			# Store initial position from qpos
+			arrow_positions[name] = env.data.qpos[qpos_addr:qpos_addr+3].copy()
+		else:
+			print(f"Warning: Arrow '{name}' not found in scene")
+	arrows_available = all(name in arrow_ids for name in ("fall", "left", "right"))
+
 	try:
 		for run_idx in range(num_runs):
 			compliant_run = run_idx >= num_runs // 2
 			env.reset(seed=base_seed + run_idx)
-			env.set_goal_angles(GOAL_ANGLES)
+			env.set_goal_angles(GOAL_ANGLES_ARMS)
 			env.apply_gain_scales(gain_cfg.kp_scale_stiff, gain_cfg.kd_scale_stiff, gain_cfg)
 
 			push_steps = int(np.ceil(push_cfg.duration_sec / env.model.opt.timestep))
@@ -604,6 +826,24 @@ def run_experiments() -> None:
 
 				obs, _, _, _, info = env.step(np.zeros(env.action_space.shape, dtype=np.float64))
 				del obs
+
+				torso_q, torso_linvel = _try_get_torso_quat_and_linvel(info)
+				fall_dir_3d = _estimate_fall_direction_vector_3d(torso_q, torso_linvel)
+				left_arm_dir, _ = _get_arm_vector_and_critical(env, "left", left_ids, right_ids)
+				right_arm_dir, _ = _get_arm_vector_and_critical(env, "right", left_ids, right_ids)
+				torso_angvel_x = float(info.get("torso_angvel_x", 0.0))
+				torso_angvel_y = float(info.get("torso_angvel_y", 0.0))
+				if arrows_available:
+					_draw_vectors_programmatic(
+						env,
+						fall_dir_3d,
+						left_arm_dir,
+						right_arm_dir,
+						arrow_ids,
+						arrow_positions,
+						torso_angvel_x,
+						torso_angvel_y,
+					)
 				env.render()
 
 				m1 = info["qfrc_actuator_l1"]
@@ -871,6 +1111,7 @@ class Op3FallControlArmsRL(gym.Env):
 		self.reward_cfg = reward_cfg or RewardConfig()
 		self.max_episode_steps = max_episode_steps
 		self._episode_step = 0
+		self.align_cfg = AlignConfig()
 		# Ensure Gym / SB3 see this env as rgb_array-only for recording.
 		self.render_mode = "rgb_array"
 
@@ -892,6 +1133,30 @@ class Op3FallControlArmsRL(gym.Env):
 
 		if seed is not None:
 			self.core_env.reset(seed=seed)
+
+		self._left_ids = {
+			"shoulder": _resolve_body_id(self.core_env.model, ["l_sho_roll_link", "l_sho_pitch_link"]),
+			"elbow": _resolve_body_id(self.core_env.model, ["l_el_link"]),
+			"hand_site": _resolve_site_id(self.core_env.model, ["l_hand"]),
+			"hand_body": _resolve_body_id(self.core_env.model, ["l_hand_link", "l_grip_link"]),
+		}
+		self._right_ids = {
+			"shoulder": _resolve_body_id(self.core_env.model, ["r_sho_roll_link", "r_sho_pitch_link"]),
+			"elbow": _resolve_body_id(self.core_env.model, ["r_el_link"]),
+			"hand_site": _resolve_site_id(self.core_env.model, ["r_hand"]),
+			"hand_body": _resolve_body_id(self.core_env.model, ["r_hand_link", "r_grip_link"]),
+		}
+
+		# Arrow bodies (free joints in scene.xml) must be re-pinned every step.
+		self._arrow_ids: dict[str, int] = {}
+		self._arrow_positions: dict[str, np.ndarray] = {}
+		for name in ["fall", "left", "right"]:
+			shaft_body_id = mujoco.mj_name2id(self.core_env.model, mujoco.mjtObj.mjOBJ_BODY, f"arrow_{name}_shaft")
+			if shaft_body_id >= 0:
+				shaft_jnt_id = self.core_env.model.body_jntadr[shaft_body_id]
+				qpos_addr = self.core_env.model.jnt_qposadr[shaft_jnt_id]
+				self._arrow_ids[name] = qpos_addr
+		self._arrows_available = all(name in self._arrow_ids for name in ("fall", "left", "right"))
 
 		self.control_joint_names = list(goal_angles.keys())
 		self._joint_indices = [self.core_env.qpos_ids[n] for n in self.control_joint_names]
@@ -919,6 +1184,28 @@ class Op3FallControlArmsRL(gym.Env):
 			high=np.inf,
 			shape=(self.obs_dim,),
 			dtype=np.float32,
+		)
+
+	def _update_scene_arrows(self, info: Dict[str, Any]) -> None:
+		if not self._arrows_available:
+			return
+
+		torso_q, torso_linvel = _try_get_torso_quat_and_linvel(info)
+		fall_dir_3d = _estimate_fall_direction_vector_3d(torso_q, torso_linvel)
+		left_arm_dir, _ = _get_arm_vector_and_critical(self.core_env, "left", self._left_ids, self._right_ids)
+		right_arm_dir, _ = _get_arm_vector_and_critical(self.core_env, "right", self._left_ids, self._right_ids)
+		torso_angvel_x = float(info.get("torso_angvel_x", 0.0))
+		torso_angvel_y = float(info.get("torso_angvel_y", 0.0))
+
+		_draw_vectors_programmatic(
+			self.core_env,
+			fall_dir_3d,
+			left_arm_dir,
+			right_arm_dir,
+			self._arrow_ids,
+			self._arrow_positions,
+			torso_angvel_x,
+			torso_angvel_y,
 		)
 
 	def _build_obs(self, info: Dict[str, Any]) -> np.ndarray:
@@ -989,11 +1276,55 @@ class Op3FallControlArmsRL(gym.Env):
 		torque_term = total_load / max(self.reward_cfg.max_torque, 1e-6)
 		speed_term = fall_speed / max(self.reward_cfg.max_fall_speed, 1e-6)
 
+		# Base penalty terms
 		reward = -(
 			self.reward_cfg.w_head * head_term
 			+ self.reward_cfg.w_torque * torque_term
 			+ self.reward_cfg.w_speed * speed_term
 		)
+
+		# Arms alignment reward: pre-impact only.
+		t_impact = float(info.get("time_to_impact", float("inf")))
+		pre_impact = (not self._switched_to_compliance) and (t_impact > self.tti_cfg.threshold)
+		if pre_impact:
+			torso_q, torso_linvel = _try_get_torso_quat_and_linvel(info)
+			raw_fall_dir = _estimate_fall_direction_vector_3d(torso_q, torso_linvel)
+
+			if float(np.linalg.norm(raw_fall_dir)) > 1e-9:
+				fall_dir = _normalize_3d(raw_fall_dir)
+
+				left_arm_dir, _ = _get_arm_vector_and_critical(self.core_env, "left", self._left_ids, self._right_ids)
+				right_arm_dir, _ = _get_arm_vector_and_critical(self.core_env, "right", self._left_ids, self._right_ids)
+
+				# Vector azimuths in XY plane for alignment angle.
+				if float(np.linalg.norm(fall_dir[:2])) > 1e-9:
+					fall_angle = float(np.arctan2(fall_dir[1], fall_dir[0]))
+				else:
+					fall_angle = 0.0
+
+				if float(np.linalg.norm(left_arm_dir[:2])) > 1e-9:
+					left_arm_angle = float(np.arctan2(left_arm_dir[1], left_arm_dir[0]))
+				else:
+					left_arm_angle = 0.0
+
+				if float(np.linalg.norm(right_arm_dir[:2])) > 1e-9:
+					right_arm_angle = float(np.arctan2(right_arm_dir[1], right_arm_dir[0]))
+				else:
+					right_arm_angle = 0.0
+
+				left_rew, _ = _alignment_score_from_angles(
+					left_arm_angle,
+					fall_angle,
+					self.align_cfg.angle_threshold_rad,
+				)
+				right_rew, _ = _alignment_score_from_angles(
+					right_arm_angle,
+					fall_angle,
+					self.align_cfg.angle_threshold_rad,
+				)
+				align_score = 0.5 * (left_rew + right_rew)
+				reward += self.reward_cfg.w_align * align_score
+
 		return float(reward)
 
 	def reset(self, *, seed: int | None = None, options: Dict[str, Any] | None = None):
@@ -1010,6 +1341,10 @@ class Op3FallControlArmsRL(gym.Env):
 		self._push_steps = int(np.ceil(self.push_cfg.duration_sec / self.core_env.model.opt.timestep))
 		del core_obs
 		self._episode_step = 0
+		if self._arrows_available:
+			for name, qpos_addr in self._arrow_ids.items():
+				self._arrow_positions[name] = self.core_env.data.qpos[qpos_addr:qpos_addr+3].copy()
+			self._update_scene_arrows(core_info)
 		obs = self._build_obs(core_info)
 		return obs, {}
 
@@ -1032,6 +1367,7 @@ class Op3FallControlArmsRL(gym.Env):
 
 		core_obs, _, _, _, info = self.core_env.step(np.zeros_like(self.core_env.action_space.low, dtype=np.float64))
 		del core_obs
+		self._update_scene_arrows(info)
 
 		# Time-to-impact based compliance trigger
 		t_impact = float(info.get("time_to_impact", float("inf")))
@@ -1180,7 +1516,7 @@ def train_ppo_forward_fall_arms(
 		def _init() -> gym.Env:
 			env = Op3FallControlArmsRL(
 				model_xml=scene_xml,
-				goal_angles=GOAL_ANGLES,
+				goal_angles=GOAL_ANGLES_ARMS,
 				reward_cfg=reward_cfg,
 				max_episode_steps=training_cfg.max_episode_steps,
 				seed=rank,
