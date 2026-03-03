@@ -1543,6 +1543,7 @@ def train_ppo_forward_fall_arms(
 		gae_lambda=training_cfg.gae_lambda,
 		verbose=1,
 		tensorboard_log=str(log_dir),
+		device="cpu",
 	)
 
 	callback = EpisodeCounterCallback(
